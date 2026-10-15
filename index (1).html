@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HF-006 | Horímetros da Usina</title>
+  <script type="module">
+    import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
+
+    const SUPABASE_URL = "https://kxyzirjogrpgexkgvmcj.supabase.co";
+    const SUPABASE_KEY = "sb_publishable_vt6ReuGagBs0RUCekMzKnw_0zG3ajCS";
+    const DEVICE_ID = "hf006-usina-concreto-01";
+
+    const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+    const $ = (id) => document.getElementById(id);
+
+    function fmtSeconds(value) {
+      const sec = Math.max(0, Math.floor(Number(value || 0)));
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const s = sec % 60;
+      return `${String(h).padStart(2,"0")}h ${String(m).padStart(2,"0")}m ${String(s).padStart(2,"0")}s`;
+    }
+
+    function fmtHours(value) {
+      return (Number(value || 0) / 3600).toLocaleString("pt-BR", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2
+      }) + " h";
+    }
+
+    function fmtPct(value) {
+      if (value === null || value === undefined) return "N/D";
+      return Number(value).toLocaleString("pt-BR", {
+        minimumFractionDigits: 1,
+        maximumFractionDigits: 1
+      }) + " %";
+    }
+
+    function fmtDate(value) {
+      if (!value) return "--";
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return "--";
+      return d.toLocaleString("pt-BR");
+    }
+
+    function reasonLabel(code) {
+      const map = {
+        0: "Não classificada",
+        1: "Parada operacional",
+        2: "Sem produção",
+        3: "Falta de material",
+        4: "Manutenção preventiva",
+        5: "Falha mecânica",
+        6: "Falha elétrica",
+        7: "Manutenção corretiva",
+        8: "Intertravamento / segurança",
+        9: "Emergência",
+        10: "Outro / investigar"
+      };
+      return map[code] ?? "Não classificada";
+    }
+
+    function onlineByLastSeen(lastSeen) {
+      if (!lastSeen) return false;
+      const age = Date.now() - new Date(lastSeen).getTime();
+      return age >= 0 && age <= 90000;
+    }
+
+    function setConnectionBadge(isOnline, lastSeen) {
+      const badge = $("cloudStatus");
+      badge.className = "status-pill " + (isOnline ? "online" : "offline");
+      badge.textContent = isOnline ? "● HF-006 ONLINE" : "● HF-006 OFFLINE";
+      $("lastSeen").textContent = lastSeen ? `Última atualização: ${fmtDate(lastSeen)}` : "Sem atualização";
+    }
+
+    function renderStatus(status) {
+      if (!status) return;
+
+      const isOnline = onlineByLastSeen(status.last_seen);
+      setConnectionBadge(isOnline, status.last_seen);
+
+      $("firmware").textContent = status.firmware || "--";
+      $("wifiRssi").textContent = status.wifi_rssi === null ? "--" : `${status.wifi_rssi} dBm`;
+      $("pending").textContent = status.pending_events ?? 0;
+      $("lost").textContent = status.queue_lost_events ?? 0;
+      $("bootCount").textContent = status.boot_count ?? 0;
+      $("clock").textContent = status.clock_synced ? "Sincronizado" : "Sem sincronismo";
+      $("mode").textContent = status.simulation ? "SIMULAÇÃO" : "PRODUÇÃO";
+      $("mode").className = "value " + (status.simulation ? "warning-text" : "ok-text");
+    }
+
+    function renderEquipment(rows) {
+      const container = $("equipmentGrid");
+      if (!rows?.length) {
+        container.innerHTML = `<div class="empty">Nenhum equipamento recebido.</div>`;
+        return;
+      }
+
+      container.innerHTML = rows.map(m => `
+        <article class="card equipment-card">
+          <div class="card-head">
+            <div>
+              <div class="equipment-name">${m.name}</div>
+              <div class="small">Canal ${Number(m.motor_id) + 1}</div>
+            </div>
+            <div class="state ${m.running ? "running" : "stopped"}">
+              ● ${m.running ? "LIGADO" : "DESLIGADO"}
+            </div>
+          </div>
+
+          <div class="metric-primary">
+            <span>Horímetro total</span>
+            <strong>${fmtSeconds(m.hourmeter_seconds)}</strong>
+            <small>${fmtHours(m.hourmeter_seconds)}</small>
+          </div>
+
+          <div class="metric-grid">
+            <div>
+              <span>${m.running ? "Partida atual" : "Parado há"}</span>
+              <strong>${fmtSeconds(m.running ? m.current_run_seconds : m.current_stop_seconds)}</strong>
+            </div>
+            <div>
+              <span>Utilização</span>
+              <strong>${fmtPct(m.utilization_percent)}</strong>
+            </div>
+            <div>
+              <span>Disponibilidade técnica</span>
+              <strong>${fmtPct(m.technical_availability_percent)}</strong>
+            </div>
+            <div>
+              <span>Partidas / Paradas</span>
+              <strong>${m.starts_total ?? 0} / ${m.stops_total ?? 0}</strong>
+            </div>
+          </div>
+
+          ${m.running ? "" : `
+            <div class="stop-reason">
+              <span>Motivo da parada</span>
+              <strong>${reasonLabel(m.stop_reason_code)}</strong>
+            </div>
+          `}
+        </article>
+      `).join("");
+    }
+
+    function renderEvents(rows) {
+      const tbody = $("eventsBody");
+
+      if (!rows?.length) {
+        tbody.innerHTML = `<tr><td colspan="6" class="empty">Nenhum evento encontrado.</td></tr>`;
+        return;
+      }
+
+      tbody.innerHTML = rows.map(e => `
+        <tr>
+          <td>${fmtDate(e.event_time || e.received_at)}</td>
+          <td>${e.motor_name || "Sistema"}</td>
+          <td><span class="event-tag">${e.event_type || "--"}</span></td>
+          <td>${e.duration_seconds ? fmtSeconds(e.duration_seconds) : "--"}</td>
+          <td>${e.reason || "--"}</td>
+          <td>${fmtDate(e.received_at)}</td>
+        </tr>
+      `).join("");
+    }
+
+    async function loadDashboard() {
+      try {
+        $("errorBox").classList.add("hidden");
+
+        const [statusReq, equipmentReq, eventsReq] = await Promise.all([
+          supabase
+            .from("device_status")
+            .select("device_id,firmware,simulation,uptime_seconds,boot_count,wifi_rssi,pending_events,queue_lost_events,free_heap,clock_synced,last_seen")
+            .eq("device_id", DEVICE_ID)
+            .maybeSingle(),
+
+          supabase
+            .from("equipment_state")
+            .select("motor_id,name,running,hourmeter_seconds,current_run_seconds,current_stop_seconds,stop_reason_code,starts_total,stops_total,utilization_percent,technical_availability_percent,last_seen")
+            .eq("device_id", DEVICE_ID)
+            .order("motor_id"),
+
+          supabase
+            .from("equipment_events")
+            .select("id,event_type,motor_id,motor_name,reason,duration_seconds,event_time,received_at")
+            .eq("device_id", DEVICE_ID)
+            .order("received_at", { ascending: false })
+            .limit(30)
+        ]);
+
+        const firstError = statusReq.error || equipmentReq.error || eventsReq.error;
+        if (firstError) throw firstError;
+
+        renderStatus(statusReq.data);
+        renderEquipment(equipmentReq.data);
+        renderEvents(eventsReq.data);
+
+        $("pageUpdated").textContent = "Painel atualizado em " + new Date().toLocaleTimeString("pt-BR");
+      } catch (err) {
+        console.error(err);
+        $("errorBox").textContent =
+          "Não foi possível ler o Supabase. Verifique se as políticas públicas de leitura foram criadas.";
+        $("errorBox").classList.remove("hidden");
+      }
+    }
+
+    window.addEventListener("DOMContentLoaded", () => {
+      loadDashboard();
+      setInterval(loadDashboard, 3000);
+      $("refreshBtn").addEventListener("click", loadDashboard);
+    });
+  </script>
+
+  <style>
+    :root{
+      --bg:#0b1220;
+      --panel:#111b2e;
+      --panel2:#17233a;
+      --border:#253550;
+      --text:#f4f7fb;
+      --muted:#8fa1bd;
+      --blue:#2f80ed;
+      --green:#30c878;
+      --red:#ef5b5b;
+      --yellow:#f6bd41;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0;
+      background:linear-gradient(180deg,#09101d,#0d1626 45%,#0b1220);
+      color:var(--text);
+      font-family:Inter,Arial,Helvetica,sans-serif;
+      min-height:100vh;
+    }
+    .wrap{max-width:1480px;margin:auto;padding:22px}
+    .topbar{
+      display:flex;justify-content:space-between;align-items:center;
+      gap:16px;flex-wrap:wrap;margin-bottom:20px
+    }
+    h1{font-size:28px;margin:0 0 5px}
+    .subtitle,.small{color:var(--muted);font-size:13px}
+    .top-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+    .status-pill{
+      border-radius:999px;padding:10px 14px;font-weight:800;font-size:13px
+    }
+    .online{background:rgba(48,200,120,.14);color:var(--green);border:1px solid rgba(48,200,120,.4)}
+    .offline{background:rgba(239,91,91,.13);color:var(--red);border:1px solid rgba(239,91,91,.38)}
+    button{
+      border:1px solid var(--border);background:var(--panel2);color:white;
+      padding:10px 14px;border-radius:9px;cursor:pointer;font-weight:700
+    }
+    button:hover{filter:brightness(1.12)}
+    .error{
+      background:rgba(239,91,91,.12);border:1px solid rgba(239,91,91,.35);
+      color:#ffd7d7;padding:12px 14px;border-radius:10px;margin-bottom:16px
+    }
+    .hidden{display:none}
+    .summary-grid{
+      display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));
+      gap:12px;margin-bottom:18px
+    }
+    .summary{
+      background:rgba(17,27,46,.94);border:1px solid var(--border);
+      border-radius:12px;padding:15px
+    }
+    .summary span{display:block;color:var(--muted);font-size:12px;margin-bottom:7px}
+    .summary .value{font-weight:800;font-size:17px}
+    .ok-text{color:var(--green)} .warning-text{color:var(--yellow)}
+    .section-title{margin:24px 0 12px;font-size:18px}
+    .equipment-grid{
+      display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:14px
+    }
+    .card{
+      background:rgba(17,27,46,.96);border:1px solid var(--border);
+      border-radius:14px;padding:17px;box-shadow:0 8px 30px rgba(0,0,0,.13)
+    }
+    .card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+    .equipment-name{font-size:18px;font-weight:800}
+    .state{font-size:12px;font-weight:900;border-radius:999px;padding:7px 9px;white-space:nowrap}
+    .running{color:var(--green);background:rgba(48,200,120,.12)}
+    .stopped{color:var(--red);background:rgba(239,91,91,.11)}
+    .metric-primary{margin:17px 0;background:#0d1728;border-radius:10px;padding:14px}
+    .metric-primary span,.metric-grid span,.stop-reason span{
+      display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.4px
+    }
+    .metric-primary strong{display:block;font-size:25px;margin:6px 0 3px}
+    .metric-primary small{color:#aab8cc}
+    .metric-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+    .metric-grid>div{background:#0d1728;border-radius:9px;padding:11px}
+    .metric-grid strong{display:block;margin-top:5px;font-size:14px}
+    .stop-reason{
+      margin-top:10px;border-left:3px solid var(--yellow);
+      background:rgba(246,189,65,.07);border-radius:8px;padding:10px 12px
+    }
+    .stop-reason strong{display:block;margin-top:4px}
+    .table-card{overflow-x:auto}
+    table{width:100%;border-collapse:collapse;min-width:850px}
+    th,td{padding:11px 10px;border-bottom:1px solid var(--border);text-align:left;font-size:13px}
+    th{color:var(--muted);font-size:11px;text-transform:uppercase}
+    .event-tag{font-size:11px;font-weight:800;background:#1d2d49;padding:5px 7px;border-radius:6px}
+    .footer{color:var(--muted);font-size:12px;text-align:center;padding:22px 0 5px}
+    .empty{color:var(--muted);padding:20px}
+    @media(max-width:650px){
+      .wrap{padding:14px}
+      h1{font-size:23px}
+      .metric-grid{grid-template-columns:1fr}
+      .equipment-grid{grid-template-columns:1fr}
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <div class="topbar">
+      <div>
+        <h1>Horímetros da Usina</h1>
+        <div class="subtitle">Monitoramento remoto HF-006</div>
+      </div>
+      <div class="top-actions">
+        <div>
+          <div id="cloudStatus" class="status-pill offline">● HF-006 OFFLINE</div>
+          <div id="lastSeen" class="small" style="margin-top:6px;text-align:right">Sem atualização</div>
+        </div>
+        <button id="refreshBtn">Atualizar</button>
+      </div>
+    </div>
+
+    <div id="errorBox" class="error hidden"></div>
+
+    <section class="summary-grid">
+      <div class="summary"><span>Modo</span><div id="mode" class="value">--</div></div>
+      <div class="summary"><span>Firmware</span><div id="firmware" class="value">--</div></div>
+      <div class="summary"><span>Sinal Wi-Fi</span><div id="wifiRssi" class="value">--</div></div>
+      <div class="summary"><span>Eventos pendentes</span><div id="pending" class="value">--</div></div>
+      <div class="summary"><span>Eventos perdidos</span><div id="lost" class="value">--</div></div>
+      <div class="summary"><span>Reinicializações</span><div id="bootCount" class="value">--</div></div>
+      <div class="summary"><span>Relógio</span><div id="clock" class="value">--</div></div>
+    </section>
+
+    <h2 class="section-title">Equipamentos</h2>
+    <section id="equipmentGrid" class="equipment-grid"></section>
+
+    <h2 class="section-title">Últimos eventos</h2>
+    <section class="card table-card">
+      <table>
+        <thead>
+          <tr>
+            <th>Horário</th>
+            <th>Equipamento</th>
+            <th>Evento</th>
+            <th>Duração</th>
+            <th>Motivo</th>
+            <th>Recebido no servidor</th>
+          </tr>
+        </thead>
+        <tbody id="eventsBody"></tbody>
+      </table>
+    </section>
+
+    <div class="footer" id="pageUpdated">Carregando dados...</div>
+  </main>
+</body>
+</html>
