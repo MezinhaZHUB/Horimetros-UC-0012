@@ -83,15 +83,26 @@
       d.setDate(d.getDate()-diff);
       return localDate(d);
     }
+    function sundayOf(dateStr){
+      const d=new Date(mondayOf(dateStr)+"T12:00:00-03:00");
+      d.setDate(d.getDate()+6);
+      return localDate(d);
+    }
     function monthStart(dateStr){ return dateStr.slice(0,8)+"01"; }
+    function monthEnd(dateStr){
+      const y=Number(dateStr.slice(0,4));
+      const m=Number(dateStr.slice(5,7));
+      const d=new Date(Date.UTC(y,m,0,15,0,0));
+      return d.toISOString().slice(0,10);
+    }
 
     function applyQuickPeriod(mode){
       periodMode=mode;
       document.querySelectorAll(".period-btn").forEach(function(b){b.classList.toggle("active",b.dataset.mode===mode);});
       const today=localDate();
       if(mode==="today"){ $("periodStart").value=today; $("periodEnd").value=today; }
-      if(mode==="week"){ $("periodStart").value=mondayOf(today); $("periodEnd").value=today; }
-      if(mode==="month"){ $("periodStart").value=monthStart(today); $("periodEnd").value=today; }
+      if(mode==="week"){ $("periodStart").value=mondayOf(today); $("periodEnd").value=sundayOf(today); }
+      if(mode==="month"){ $("periodStart").value=monthStart(today); $("periodEnd").value=monthEnd(today); }
       loadOverview();
     }
 
@@ -187,9 +198,21 @@
 
     function renderTimeline(days){
       const box=$("timelineDays");
-      const active=days.filter(function(d){return d.has_activity;});
-      if(!active.length){ box.innerHTML='<div class="empty">Sem atividade no período.</div>'; return; }
-      box.innerHTML=active.map(function(d){
+      const today=localDate();
+      if(!days.length){ box.innerHTML='<div class="empty">Sem dias no período selecionado.</div>'; return; }
+
+      box.innerHTML=days.map(function(d){
+        if(!d.has_activity){
+          const future=d.date>today;
+          return '<article class="timeline-day card timeline-empty-day">'+
+            '<div class="timeline-head"><div><strong>'+esc(d.date.split("-").reverse().join("/"))+'</strong>'+
+            '<span>'+(future?'Dia futuro':'Sem atividade registrada')+'</span></div>'+
+            '<div class="day-kpis"><b>—</b><span>não afeta a disponibilidade</span></div></div>'+
+            '<div class="timeline-track timeline-track-empty"><div class="timeline-empty-label">'+
+            (future?'Aguardando operação':'Nenhuma operação detectada neste dia')+
+            '</div></div></article>';
+        }
+
         const startMs=new Date(d.detected_start_at).getTime(), endMs=new Date(d.detected_end_at).getTime();
         const span=Math.max(1,endMs-startMs);
         const segs=(d.timeline||[]).map(function(s){
@@ -518,6 +541,7 @@
     <div class="small" style="margin-bottom:12px">Disponibilidade = horas trabalhadas ÷ jornada detectada/corrigida. <strong>Refeição é excluída do tempo programado</strong>; todos os demais motivos de parada reduzem a disponibilidade.</div>
 
     <h2 class="section-title">Linha do tempo</h2>
+    <div class="small" style="margin:-4px 0 12px">Hoje mostra 1 dia. Semana mostra os 7 dias completos, de segunda a domingo. Mês mostra todos os dias do mês selecionado. Dias sem atividade e dias futuros aparecem apenas como referência e não entram na disponibilidade.</div>
     <div id="timelineDays"></div>
 
     <article id="stopEditor" class="card editor hidden">
