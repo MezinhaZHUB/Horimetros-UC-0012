@@ -204,12 +204,14 @@
       box.innerHTML=days.map(function(d){
         if(!d.has_activity){
           const future=d.date>today;
+          const beforeOfficial=!!d.before_official_start;
+          const statusLabel=beforeOfficial?'Antes do início oficial':(future?'Dia futuro':'Sem atividade registrada');
+          const trackLabel=beforeOfficial?'Período de testes — desconsiderado':(future?'Aguardando operação':'Nenhuma operação detectada neste dia');
           return '<article class="timeline-day card timeline-empty-day">'+
             '<div class="timeline-head"><div><strong>'+esc(d.date.split("-").reverse().join("/"))+'</strong>'+
-            '<span>'+(future?'Dia futuro':'Sem atividade registrada')+'</span></div>'+
+            '<span>'+statusLabel+'</span></div>'+
             '<div class="day-kpis"><b>—</b><span>não afeta a disponibilidade</span></div></div>'+
-            '<div class="timeline-track timeline-track-empty"><div class="timeline-empty-label">'+
-            (future?'Aguardando operação':'Nenhuma operação detectada neste dia')+
+            '<div class="timeline-track timeline-track-empty"><div class="timeline-empty-label">'+trackLabel+
             '</div></div></article>';
         }
 
