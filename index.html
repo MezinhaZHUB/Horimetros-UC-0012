@@ -268,12 +268,13 @@
 
     function toDateTimeLocal(v){
       const d=new Date(v);
-      const parts=new Intl.DateTimeFormat("sv-SE",{timeZone:TZ,year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false}).format(d);
+      const parts=new Intl.DateTimeFormat("sv-SE",{timeZone:TZ,year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false}).format(d);
       return parts.replace(" ","T");
     }
     function dtLocalToIso(v){
       if(!v) return null;
-      return new Date(v+":00-03:00").toISOString();
+      const normalized=v.length===16 ? v+":00" : v;
+      return new Date(normalized+"-03:00").toISOString();
     }
 
     async function saveStop(){
@@ -547,8 +548,8 @@
     <article id="stopEditor" class="card editor hidden">
       <h3 id="stopEditorTitle">Editar parada</h3>
       <div class="editor-grid">
-        <div class="filter"><label class="small">Início</label><input id="stopStart" type="datetime-local"></div>
-        <div class="filter"><label class="small">Fim</label><input id="stopEnd" type="datetime-local"></div>
+        <div class="filter"><label class="small">Início</label><input id="stopStart" type="datetime-local" step="1"></div>
+        <div class="filter"><label class="small">Fim</label><input id="stopEnd" type="datetime-local" step="1"></div>
         <div class="filter"><label class="small">Motivo</label><select id="stopReason"></select></div>
         <div class="filter"><label class="small">Observação</label><input id="stopNote" type="text" placeholder="Opcional"></div>
       </div>
