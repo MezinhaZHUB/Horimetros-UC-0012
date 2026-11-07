@@ -1,2947 +1,592 @@
 <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>UC 0012 | Horímetros e Gestão</title>
-
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>UC 0012 | Operação e Gestão</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
-
   <script type="module">
     import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
 
     const SUPABASE_URL = "https://kxyzirjogrpgexkgvmcj.supabase.co";
     const SUPABASE_KEY = "sb_publishable_vt6ReuGagBs0RUCekMzKnw_0zG3ajCS";
     const DEVICE_ID = "hf006-usina-concreto-01";
-
-    const COMMAND_URL =
-      "https://kxyzirjogrpgexkgvmcj.supabase.co/functions/v1/hf006-command";
-
-    const DASHBOARD_URL =
-      "https://kxyzirjogrpgexkgvmcj.supabase.co/functions/v1/hf006-dashboard";
-
+    const MANAGEMENT_URL = SUPABASE_URL + "/functions/v1/hf006-management";
     const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+    const TZ = "America/Sao_Paulo";
+    const $ = function(id){ return document.getElementById(id); };
 
-    const $ = (id) => document.getElementById(id);
+    let latestOverview = null;
+    let selectedStop = null;
+    let productionEditId = null;
+    let paretoChart = null;
+    let productionChart = null;
+    let periodMode = "today";
 
-    let latestStatus = null;
-    let latestEquipment = [];
-    let latestAnalytics = null;
-
-    let chartReasonsCount = null;
-    let chartReasonsTime = null;
-
-    // ------------------------------------------------------------
-    // Estado da tela
-    //
-    // Os cartoes dos equipamentos sao criados UMA vez e depois so
-    // os textos mudam. A justificativa usa botoes fixos (nao ha mais
-    // lista suspensa), entao o refresh automatico nao fecha nada nem
-    // apaga a escolha do operador.
-    // ------------------------------------------------------------
-
-    // motor_id -> { code, stopKey } (escolha ainda nao enviada)
-    const reasonDrafts = new Map();
-
-    // motor_id -> painel de justificativa aberto
-    const reasonOpen = new Map();
-
-    // motor_id -> envio/acompanhamento em andamento
-    const reasonSending = new Set();
-
-    // Mensagens de envio/confirmacao por equipamento.
-    const reasonCommandUi = new Map();
-
-    // motor_id -> referencias aos elementos do cartao
-    const equipmentCards = new Map();
-
-    // motor_id -> ultima linha recebida de equipment_state
-    const equipmentLast = new Map();
-
-    let eventsKey = "";
-    let filterKey = "";
-    let dashboardLoading = false;
-
-    const REASONS = [
-      { code: 1, label: "Parada operacional", group: "ope" },
-      { code: 2, label: "Sem produção", group: "ope" },
-      { code: 3, label: "Falta de material", group: "ope" },
-      { code: 4, label: "Manutenção preventiva", group: "pre" },
-      { code: 5, label: "Falha mecânica", group: "tec" },
-      { code: 6, label: "Falha elétrica", group: "tec" },
-      { code: 7, label: "Manutenção corretiva", group: "tec" },
-      { code: 8, label: "Intertravamento / segurança", group: "tec" },
-      { code: 9, label: "Emergência", group: "tec" },
-      { code: 10, label: "Outro / investigar", group: "out" }
-    ];
-
-    const REASON_GROUPS = [
-      ["ope", "Operacional"],
-      ["pre", "Manutenção programada"],
-      ["tec", "Técnica (afeta a disponibilidade)"],
-      ["out", "Outro"]
-    ];
-
-    const GROUP_COLORS = {
-      ope: "#2f80ed",
-      pre: "#a855f7",
-      tec: "#ef5b5b",
-      out: "#8fa1bd",
-      nc: "#f6bd41"
-    };
-
-    function escapeHtml(value) {
-      return String(value ?? "")
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;")
-        .replaceAll("'", "&#039;");
+    function esc(v){
+      return String(v == null ? "" : v)
+        .replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;")
+        .replaceAll('"',"&quot;").replaceAll("'","&#039;");
     }
-
-    function fmtSeconds(value) {
-      const sec = Math.max(0, Math.floor(Number(value || 0)));
-      const h = Math.floor(sec / 3600);
-      const m = Math.floor((sec % 3600) / 60);
-      const s = sec % 60;
-
-      return `${String(h).padStart(2,"0")}h ${String(m).padStart(2,"0")}m ${String(s).padStart(2,"0")}s`;
+    function localDate(d){
+      return new Intl.DateTimeFormat("en-CA",{timeZone:TZ,year:"numeric",month:"2-digit",day:"2-digit"}).format(d || new Date());
     }
-
-    function fmtHoursFromSeconds(value) {
-      if (value === null || value === undefined) return "N/D";
-
-      return (Number(value || 0) / 3600).toLocaleString("pt-BR", {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2
-      }) + " h";
+    function localTime(v){
+      if(!v) return "--";
+      const d = new Date(v);
+      if(Number.isNaN(d.getTime())) return "--";
+      return d.toLocaleTimeString("pt-BR",{timeZone:TZ,hour:"2-digit",minute:"2-digit"});
     }
-
-    function fmtHours(value) {
-      if (value === null || value === undefined || !Number.isFinite(Number(value))) {
-        return "N/D";
-      }
-
-      return Number(value).toLocaleString("pt-BR", {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2
-      }) + " h";
+    function localDateTime(v){
+      if(!v) return "--";
+      const d = new Date(v);
+      if(Number.isNaN(d.getTime())) return "--";
+      return d.toLocaleString("pt-BR",{timeZone:TZ});
     }
-
-    function fmtPct(value) {
-      if (value === null || value === undefined || !Number.isFinite(Number(value))) {
-        return "N/D";
-      }
-
-      return Number(value).toLocaleString("pt-BR", {
-        minimumFractionDigits: 1,
-        maximumFractionDigits: 1
-      }) + " %";
+    function fmtSec(value){
+      const sec = Math.max(0,Math.round(Number(value||0)));
+      const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = sec%60;
+      return String(h).padStart(2,"0")+"h "+String(m).padStart(2,"0")+"m "+String(s).padStart(2,"0")+"s";
     }
-
-    function fmtDate(value) {
-      if (!value) return "--";
-
-      const d = new Date(value);
-
-      if (Number.isNaN(d.getTime())) return "--";
-
-      return d.toLocaleString("pt-BR");
+    function fmtShort(value){
+      const sec = Math.max(0,Math.round(Number(value||0)));
+      const h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60);
+      return h+"h "+String(m).padStart(2,"0")+"m";
     }
-
-    function reasonLabel(code) {
-      const map = {
-        0: "Não classificada",
-        1: "Parada operacional",
-        2: "Sem produção",
-        3: "Falta de material",
-        4: "Manutenção preventiva",
-        5: "Falha mecânica",
-        6: "Falha elétrica",
-        7: "Manutenção corretiva",
-        8: "Intertravamento / segurança",
-        9: "Emergência",
-        10: "Outro / investigar"
-      };
-
-      return map[code] ?? "Não classificada";
+    function fmtPct(value){
+      if(value===null || value===undefined || !Number.isFinite(Number(value))) return "N/D";
+      return Number(value).toLocaleString("pt-BR",{minimumFractionDigits:1,maximumFractionDigits:1})+"%";
     }
-
-    function setText(el, value) {
-      const v = String(value ?? "");
-      if (el && el.textContent !== v) el.textContent = v;
+    function fmtM3(value){
+      return Number(value||0).toLocaleString("pt-BR",{minimumFractionDigits:0,maximumFractionDigits:3})+" m³";
     }
-
-    function setClass(el, value) {
-      if (el && el.className !== value) el.className = value;
+    function setStatus(msg,kind){
+      const el=$("saveStatus");
+      el.textContent=msg||"";
+      el.className="save-status "+(kind||"");
     }
-
-    function setFlag(el, cls, on) {
-      if (el && el.classList.contains(cls) !== on) el.classList.toggle(cls, on);
-    }
-
-    function refs(root) {
-      const r = {};
-      root.querySelectorAll("[data-k]").forEach(e => { r[e.dataset.k] = e; });
-      return r;
-    }
-
-    function reasonGroupOf(code) {
-      const r = REASONS.find(x => x.code === Number(code));
-      return r ? r.group : "nc";
-    }
-
-    function setReasonUi(
-      motorId,
-      className,
-      message
-    ) {
-      reasonCommandUi.set(
-        Number(motorId),
-        {
-          className,
-          message
-        }
-      );
-
-      const el =
-        $(`reason-status-${motorId}`);
-
-      if (el) {
-        setClass(el, `command-status ${className || ""}`.trim());
-        setText(el, message || "");
-      }
-    }
-
-    function onlineByLastSeen(lastSeen) {
-      if (!lastSeen) return false;
-
-      const age = Date.now() - new Date(lastSeen).getTime();
-
-      return age >= 0 && age <= 90000;
-    }
-
-    function setConnectionBadge(isOnline, lastSeen) {
-      const badge = $("cloudStatus");
-
-      badge.className =
-        "status-pill " +
-        (isOnline ? "online" : "offline");
-
-      badge.textContent =
-        isOnline
-        ? "● HF-006 ONLINE"
-        : "● HF-006 OFFLINE";
-
-      $("lastSeen").textContent =
-        lastSeen
-        ? `Última atualização: ${fmtDate(lastSeen)}`
-        : "Sem atualização";
-    }
-
-    function renderStatus(status) {
-      latestStatus = status;
-
-      if (!status) return;
-
-      const isOnline =
-        onlineByLastSeen(status.last_seen);
-
-      setConnectionBadge(
-        isOnline,
-        status.last_seen
-      );
-
-      $("firmware").textContent =
-        status.firmware || "--";
-
-      $("firmwareSystem").textContent =
-        status.firmware || "--";
-
-      $("wifiRssi").textContent =
-        status.wifi_rssi === null ||
-        status.wifi_rssi === undefined
-        ? "--"
-        : `${status.wifi_rssi} dBm`;
-
-      $("pending").textContent =
-        status.pending_events ?? 0;
-
-      const pendingCount =
-        Number(status.pending_events || 0);
-
-      const queueNotice =
-        $("queueNotice");
-
-      if (queueNotice) {
-        if (pendingCount > 0) {
-          queueNotice.classList.remove("hidden");
-          queueNotice.textContent =
-            `A fila offline ainda possui ${pendingCount} evento(s) pendente(s). ` +
-            `Eles estão sendo enviados em segundo plano e podem ser antigos.`;
-        }
-        else {
-          queueNotice.classList.add("hidden");
-          queueNotice.textContent = "";
-        }
-      }
-
-      $("lost").textContent =
-        status.queue_lost_events ?? 0;
-
-      $("bootCount").textContent =
-        status.boot_count ?? 0;
-
-      $("clock").textContent =
-        status.clock_synced
-        ? "Sincronizado"
-        : "Sem sincronismo";
-
-      $("mode").textContent =
-        status.simulation
-        ? "SIMULAÇÃO"
-        : "PRODUÇÃO";
-
-      $("mode").className =
-        "value " +
-        (status.simulation
-          ? "warning-text"
-          : "ok-text");
-
-      $("masterSync").textContent =
-        status.counter_master_synced
-        ? (
-            status.counter_master_commissioned
-            ? "Sincronizado"
-            : "Aguardando comissionamento"
-          )
-        : "Não sincronizado";
-
-      $("masterSync").className =
-        "value " +
-        (
-          status.counter_master_synced &&
-          status.counter_master_commissioned
-          ? "ok-text"
-          : "warning-text"
-        );
-
-      $("hardwareUid").textContent =
-        status.hardware_uid || "--";
-
-      $("protocolVersion").textContent =
-        status.protocol_version ?? "--";
-    }
-
-    function paintReasonEditor(motorId) {
-      const c = equipmentCards.get(motorId);
-      const m = equipmentLast.get(motorId);
-      if (!c || !m) return;
-
-      const draft = reasonDrafts.get(motorId);
-      const applied = Number(m.stop_reason_code || 0);
-      const selected = draft ? draft.code : applied;
-
-      c.options.forEach(b => setFlag(b, "selected", Number(b.dataset.code) === selected));
-
-      const sending = reasonSending.has(motorId);
-      c.send.disabled = sending || !draft || draft.code === applied;
-      c.options.forEach(b => { b.disabled = sending; });
-
-      const open = reasonOpen.get(motorId) === true;
-      setFlag(c.panel, "hidden", !open);
-      setFlag(c.open, "hidden", open);
-    }
-
-    function openReasonEditor(motorId, open) {
-      reasonOpen.set(motorId, open);
-      if (!open) reasonDrafts.delete(motorId);
-      paintReasonEditor(motorId);
-    }
-
-    function buildEquipmentCard(motorId) {
-      const card = document.createElement("article");
-      card.className = "card equipment-card";
-      card.dataset.motor = String(motorId);
-
-      const groups = REASON_GROUPS.map(([g, title]) => `
-        <div class="reason-group">
-          <div class="reason-group-title">${title}</div>
-          <div class="reason-options">
-            ${REASONS.filter(r => r.group === g).map(r => `
-              <button type="button" class="reason-opt" data-g="${r.group}" data-code="${r.code}">
-                ${escapeHtml(r.label)}
-              </button>`).join("")}
-          </div>
-        </div>`).join("");
-
-      card.innerHTML = `
-        <div class="card-head">
-          <div>
-            <div class="equipment-name" data-k="name"></div>
-            <div class="small">Canal ${motorId + 1}</div>
-          </div>
-          <div class="state" data-k="state"></div>
-        </div>
-
-        <div class="metric-primary">
-          <span>Horímetro total</span>
-          <strong data-k="hms"></strong>
-          <small data-k="hours"></small>
-        </div>
-
-        <div class="metric-grid">
-          <div><span data-k="curLabel"></span><strong data-k="cur"></strong></div>
-          <div><span>Utilização da sessão</span><strong data-k="util"></strong></div>
-          <div><span>Disp. técnica da sessão</span><strong data-k="disp"></strong></div>
-          <div><span>Partidas / Paradas</span><strong data-k="startsStops"></strong></div>
-        </div>
-
-        <div data-k="stopBox" class="hidden">
-          <div class="stop-reason" data-k="stopReasonBox">
-            <span>Motivo aplicado na HF-006</span>
-            <strong data-k="reason"></strong>
-          </div>
-
-          <div class="reason-editor">
-            <button type="button" class="primary" data-k="open">Justificar parada</button>
-
-            <div data-k="panel" class="hidden">
-              <div class="small">Escolha o motivo desta parada:</div>
-              ${groups}
-              <div class="reason-actions">
-                <button type="button" class="primary" data-k="send">Confirmar justificativa</button>
-                <button type="button" data-k="cancel">Cancelar</button>
-              </div>
-            </div>
-
-            <div id="reason-status-${motorId}" class="command-status" data-k="status"></div>
-          </div>
-        </div>
-      `;
-
-      const r = refs(card);
-      r.card = card;
-      r.options = Array.from(card.querySelectorAll(".reason-opt"));
-
-      r.options.forEach(b => b.addEventListener("click", () => {
-        if (reasonSending.has(motorId)) return;
-        const m = equipmentLast.get(motorId);
-        reasonDrafts.set(motorId, {
-          code: Number(b.dataset.code),
-          stopKey: m ? String(m.stops_total ?? "") : ""
-        });
-        paintReasonEditor(motorId);
-        setReasonUi(motorId, "pending-text",
-          `Selecionado: ${reasonLabel(Number(b.dataset.code))}. Toque em "Confirmar justificativa".`);
-      }));
-
-      r.open.addEventListener("click", () => {
-        openReasonEditor(motorId, true);
-        setReasonUi(motorId, "", "");
-      });
-
-      r.cancel.addEventListener("click", () => {
-        openReasonEditor(motorId, false);
-        setReasonUi(motorId, "", "");
-      });
-
-      r.send.addEventListener("click", () => window.sendReason(motorId));
-
-      const ui = reasonCommandUi.get(motorId);
-      if (ui) {
-        setClass(r.status, `command-status ${ui.className || ""}`.trim());
-        setText(r.status, ui.message || "");
-      }
-
-      return r;
-    }
-
-    function updateEquipmentCard(m) {
-      const motorId = Number(m.motor_id);
-      let c = equipmentCards.get(motorId);
-      if (!c) return;
-
-      equipmentLast.set(motorId, m);
-
-      const running = !!m.running;
-      const unclassified = !running && Number(m.stop_reason_code || 0) === 0;
-
-      setText(c.name, m.name);
-      setText(c.state, running ? "● LIGADO" : (unclassified ? "● PARADO · SEM MOTIVO" : "● DESLIGADO"));
-      setClass(c.state, "state " + (running ? "running" : (unclassified ? "unclassified" : "stopped")));
-      setFlag(c.card, "needs-reason", unclassified);
-
-      setText(c.hms, fmtSeconds(m.hourmeter_seconds));
-      setText(c.hours, fmtHoursFromSeconds(m.hourmeter_seconds));
-      setText(c.curLabel, running ? "Partida atual" : "Parado há");
-      setText(c.cur, fmtSeconds(running ? m.current_run_seconds : m.current_stop_seconds));
-      setText(c.util, fmtPct(m.utilization_percent));
-      setText(c.disp, fmtPct(m.technical_availability_percent));
-      setText(c.startsStops, `${m.starts_total ?? 0} / ${m.stops_total ?? 0}`);
-
-      if (running) {
-        if (reasonOpen.get(motorId) || reasonDrafts.has(motorId)) {
-          if (reasonDrafts.has(motorId) && !reasonSending.has(motorId)) {
-            setReasonUi(motorId, "warning-text", "O equipamento partiu antes de a justificativa ser enviada.");
-          }
-          if (!reasonSending.has(motorId)) openReasonEditor(motorId, false);
-        }
-        setFlag(c.stopBox, "hidden", true);
-        return;
-      }
-
-      // Escolha feita para uma parada anterior nao vale para a atual.
-      const draft = reasonDrafts.get(motorId);
-      const stopKey = String(m.stops_total ?? "");
-      if (draft && draft.stopKey !== stopKey && !reasonSending.has(motorId)) {
-        reasonDrafts.delete(motorId);
-        setReasonUi(motorId, "warning-text", "Começou outra parada. Confira o motivo antes de enviar.");
-      }
-
-      setText(c.reason, reasonLabel(m.stop_reason_code));
-      setFlag(c.reason, "warning-text", unclassified);
-      setText(c.open, unclassified ? "Justificar parada" : "Alterar justificativa");
-      setFlag(c.stopBox, "hidden", false);
-      paintReasonEditor(motorId);
-    }
-
-    function renderEquipment(rows) {
-      latestEquipment = rows || [];
-
-      const container =
-        $("equipmentGrid");
-
-      if (!rows?.length) {
-        if (!equipmentCards.size) {
-          container.innerHTML =
-            `<div class="empty">Nenhum equipamento recebido.</div>`;
-        }
-
-        return;
-      }
-
-      // Cria cartoes que ainda nao existem (normalmente so na 1a carga).
-      const ids = rows.map(m => Number(m.motor_id));
-      const layoutKey = ids.join(",");
-
-      if (container.dataset.layout !== layoutKey) {
-        container.textContent = "";
-        ids.forEach(id => {
-          if (!equipmentCards.has(id)) {
-            equipmentCards.set(id, buildEquipmentCard(id));
-          }
-          container.appendChild(equipmentCards.get(id).card);
-        });
-        container.dataset.layout = layoutKey;
-      }
-
-      rows.forEach(updateEquipmentCard);
-
-      const pendentes = rows.filter(m => !m.running && Number(m.stop_reason_code || 0) === 0).length;
-      const el = $("unclassifiedStops");
-      if (el) {
-        setText(el, pendentes);
-        setClass(el, "value " + (pendentes > 0 ? "warning-text" : "ok-text"));
-      }
-    }
-
-    function renderEvents(rows) {
-      const tbody =
-        $("eventsBody");
-
-      const key =
-        (rows || []).map(e => `${e.id}:${e.reason ?? ""}`).join("|");
-
-      if (key === eventsKey) return;
-
-      eventsKey = key;
-
-      if (!rows?.length) {
-        tbody.innerHTML =
-          `<tr><td colspan="6" class="empty">Nenhum evento encontrado.</td></tr>`;
-
-        return;
-      }
-
-      tbody.innerHTML =
-        rows.map(e => `
-          <tr>
-            <td>${fmtDate(e.event_time || e.received_at)}</td>
-            <td>${escapeHtml(e.motor_name || "Sistema")}</td>
-            <td><span class="event-tag">${escapeHtml(e.event_type || "--")}</span></td>
-            <td>${e.duration_seconds ? fmtSeconds(e.duration_seconds) : "--"}</td>
-            <td>${escapeHtml(e.reason || "--")}</td>
-            <td>${fmtDate(e.received_at)}</td>
-          </tr>
-        `).join("");
-    }
-
-    async function loadDashboard() {
-      if (dashboardLoading) return;
-
-      dashboardLoading = true;
-
-      try {
-        $("errorBox").classList.add("hidden");
-
-        const [
-          statusReq,
-          equipmentReq,
-          eventsReq
-        ] = await Promise.all([
-          supabase
-            .from("device_status")
-            .select(
-              "device_id,firmware,simulation,uptime_seconds,boot_count,wifi_rssi,pending_events,queue_lost_events,free_heap,clock_synced,last_seen,hardware_uid,protocol_version,counter_master_synced,counter_master_commissioned"
-            )
-            .eq("device_id", DEVICE_ID)
-            .maybeSingle(),
-
-          supabase
-            .from("equipment_state")
-            .select(
-              "motor_id,name,running,hourmeter_seconds,current_run_seconds,current_stop_seconds,stop_reason_code,starts_total,stops_total,utilization_percent,technical_availability_percent,last_seen"
-            )
-            .eq("device_id", DEVICE_ID)
-            .order("motor_id"),
-
-          supabase
-            .from("equipment_events")
-            .select(
-              "id,event_type,motor_id,motor_name,reason,duration_seconds,event_time,received_at"
-            )
-            .eq("device_id", DEVICE_ID)
-            .neq("event_type", "SISTEMA_INICIADO")
-            .order("received_at", { ascending: false })
-            .limit(30)
-        ]);
-
-        const firstError =
-          statusReq.error ||
-          equipmentReq.error ||
-          eventsReq.error;
-
-        if (firstError) throw firstError;
-
-        renderStatus(statusReq.data);
-        renderEquipment(equipmentReq.data);
-        renderEvents(eventsReq.data);
-
-        $("pageUpdated").textContent =
-          "Painel atualizado em " +
-          new Date().toLocaleTimeString("pt-BR");
-      }
-      catch (err) {
-        console.error(err);
-
-        $("errorBox").textContent =
-          "Não foi possível ler o Supabase. Verifique a conexão e as políticas de leitura.";
-
-        $("errorBox").classList.remove("hidden");
-      }
-      finally {
-        dashboardLoading = false;
-      }
-    }
-
-    async function postCommand(body, pin) {
-      const response =
-        await fetch(
-          COMMAND_URL,
-          {
-            method: "POST",
-
-            headers: {
-              "Content-Type": "application/json",
-              "X-Operator-Pin": pin
-            },
-
-            body:
-              JSON.stringify(body)
-          }
-        );
-
-      let data = null;
-
-      try {
-        data =
-          await response.json();
-      }
-      catch {
-        data = {};
-      }
-
-      if (!response.ok) {
-        throw new Error(
-          data?.error ||
-          `HTTP ${response.status}`
-        );
-      }
-
+    function pin(){ return $("operatorPin").value.trim(); }
+
+    async function mgmt(body,needPin){
+      const headers={"Content-Type":"application/json"};
+      if(needPin) headers["X-Operator-Pin"]=pin();
+      const res=await fetch(MANAGEMENT_URL,{method:"POST",headers:headers,body:JSON.stringify(body)});
+      const data=await res.json().catch(function(){return {};});
+      if(!res.ok) throw new Error(data.error||("HTTP "+res.status));
       return data;
     }
 
-    async function pollCommand(
-      commandId,
-      pin,
-      motorId
-    ) {
-      const statusEl =
-        $(`reason-status-${motorId}`);
+    function mondayOf(dateStr){
+      const d=new Date(dateStr+"T12:00:00-03:00");
+      const day=d.getDay();
+      const diff=(day===0?6:day-1);
+      d.setDate(d.getDate()-diff);
+      return localDate(d);
+    }
+    function monthStart(dateStr){ return dateStr.slice(0,8)+"01"; }
 
-      for (
-        let i = 0;
-        i < 30;
-        i++
-      ) {
-        await new Promise(
-          resolve =>
-            setTimeout(resolve, 2000)
-        );
-
-        const data =
-          await postCommand(
-            {
-              kind:
-                "command_status",
-
-              command_id:
-                commandId
-            },
-            pin
-          );
-
-        const status =
-          data?.command?.status;
-
-        if (
-          status ===
-          "applied"
-        ) {
-          setReasonUi(
-            motorId,
-            "success",
-            "✓ Justificativa confirmada pela HF-006."
-          );
-
-          reasonDrafts.delete(
-            Number(motorId)
-          );
-
-          reasonOpen.set(Number(motorId), false);
-
-          await loadDashboard();
-
-          return;
-        }
-
-        if (
-          status ===
-            "rejected" ||
-          status ===
-            "cancelled"
-        ) {
-          setReasonUi(
-            motorId,
-            "error-text",
-            "✕ " +
-            (
-              data?.command?.device_message ||
-              "Comando rejeitado."
-            )
-          );
-
-          await loadDashboard();
-
-          return;
-        }
-
-        setReasonUi(
-          motorId,
-          "pending-text",
-          status ===
-            "delivered"
-          ? "Comando entregue à HF-006. Aguardando confirmação..."
-          : "Comando registrado. Aguardando a HF-006..."
-        );
-      }
-
-      setReasonUi(
-        motorId,
-        "pending-text",
-        "Comando continua pendente. A placa pode estar offline."
-      );
+    function applyQuickPeriod(mode){
+      periodMode=mode;
+      document.querySelectorAll(".period-btn").forEach(function(b){b.classList.toggle("active",b.dataset.mode===mode);});
+      const today=localDate();
+      if(mode==="today"){ $("periodStart").value=today; $("periodEnd").value=today; }
+      if(mode==="week"){ $("periodStart").value=mondayOf(today); $("periodEnd").value=today; }
+      if(mode==="month"){ $("periodStart").value=monthStart(today); $("periodEnd").value=today; }
+      loadOverview();
     }
 
-    window.sendReason =
-      async function(motorId) {
-        motorId = Number(motorId);
+    async function loadLive(){
+      try{
+        const reqs=await Promise.all([
+          supabase.from("device_status").select("firmware,wifi_rssi,last_seen,pending_events,boot_count,clock_synced").eq("device_id",DEVICE_ID).maybeSingle(),
+          supabase.from("equipment_state").select("motor_id,name,running,hourmeter_seconds,current_run_seconds,current_stop_seconds,starts_total,stops_total,last_seen").eq("device_id",DEVICE_ID).in("motor_id",[0,1,2]).order("motor_id"),
+          supabase.from("equipment_events").select("id,event_type,motor_id,motor_name,event_time,received_at,duration_seconds").eq("device_id",DEVICE_ID).in("motor_id",[0,1,2]).in("event_type",["LIGOU","DESLIGOU"]).order("received_at",{ascending:false}).limit(20)
+        ]);
+        if(reqs[0].error) throw reqs[0].error;
+        if(reqs[1].error) throw reqs[1].error;
+        if(reqs[2].error) throw reqs[2].error;
+        renderLiveStatus(reqs[0].data);
+        renderLiveCards(reqs[1].data||[]);
+        renderEvents(reqs[2].data||[]);
+      }catch(e){
+        $("liveError").textContent="Falha ao atualizar operação: "+e.message;
+        $("liveError").classList.remove("hidden");
+      }
+    }
 
-        const pin =
-          $("operatorPin").value.trim();
+    function renderLiveStatus(s){
+      if(!s) return;
+      const online=s.last_seen && (Date.now()-new Date(s.last_seen).getTime())<=90000;
+      $("cloudStatus").textContent=online?"● HF-006 ONLINE":"● HF-006 OFFLINE";
+      $("cloudStatus").className="pill "+(online?"ok":"bad");
+      $("lastSeen").textContent="Última atualização: "+localDateTime(s.last_seen);
+      $("firmware").textContent=s.firmware||"--";
+      $("wifiRssi").textContent=(s.wifi_rssi==null?"--":s.wifi_rssi+" dBm");
+      $("pendingEvents").textContent=s.pending_events??0;
+    }
 
-        const draft =
-          reasonDrafts.get(motorId);
+    function displayName(m){
+      if(Number(m.motor_id)===2) return "Correia Transportadora";
+      return m.name||("Canal "+(Number(m.motor_id)+1));
+    }
 
-        const reasonCode =
-          draft ? Number(draft.code) : NaN;
-
-        if (reasonSending.has(motorId)) return;
-
-        if (!pin) {
-          setReasonUi(
-            motorId,
-            "error-text",
-            "Informe o PIN do operador no topo da página."
-          );
-
-          $("operatorPin").focus();
-
-          return;
-        }
-
-        if (
-          !Number.isInteger(reasonCode) ||
-          reasonCode < 1 ||
-          reasonCode > 10
-        ) {
-          setReasonUi(
-            motorId,
-            "error-text",
-            "Selecione um motivo válido."
-          );
-
-          return;
-        }
-
-        reasonSending.add(motorId);
-        paintReasonEditor(motorId);
-
-        try {
-          setReasonUi(
-            motorId,
-            "pending-text",
-            "Enviando justificativa..."
-          );
-
-          const data =
-            await postCommand(
-              {
-                kind:
-                  "create_reason_command",
-
-                device_id:
-                  DEVICE_ID,
-
-                motor_id:
-                  motorId,
-
-                reason_code:
-                  reasonCode
-              },
-              pin
-            );
-
-          const commandId =
-            data?.command?.id;
-
-          if (!commandId) {
-            throw new Error(
-              "Servidor não retornou o comando."
-            );
-          }
-
-          setReasonUi(
-            motorId,
-            "pending-text",
-            `Comando #${commandId} registrado. Aguardando a HF-006...`
-          );
-
-          await pollCommand(
-            commandId,
-            pin,
-            motorId
-          );
-        }
-        catch (err) {
-          console.error(err);
-
-          // A escolha continua marcada para o operador tentar de novo.
-          setReasonUi(
-            motorId,
-            "error-text",
-            err?.message ||
-            "Falha ao enviar justificativa."
-          );
-        }
-        finally {
-          reasonSending.delete(motorId);
-          paintReasonEditor(motorId);
-        }
+    function renderLiveCards(rows){
+      const ctx={
+        0:"Linha atualmente parada por quebra.",
+        1:"Linha principal em operação.",
+        2:"Sinal comum das correias horizontal e inclinada."
       };
-
-    function localDateInputValue(date) {
-      const d =
-        new Date(
-          date.getTime() -
-          date.getTimezoneOffset() *
-          60000
-        );
-
-      return d
-        .toISOString()
-        .slice(0,10);
+      $("equipmentGrid").innerHTML=rows.map(function(m){
+        const running=!!m.running;
+        const current=running?m.current_run_seconds:m.current_stop_seconds;
+        return '<article class="card equipment-card">'+
+          '<div class="card-head"><div><h3>'+esc(displayName(m))+'</h3><div class="muted">'+esc(ctx[m.motor_id]||"")+'</div></div>'+
+          '<span class="state '+(running?"running":"stopped")+'">'+(running?"● LIGADO":"● PARADO")+'</span></div>'+
+          '<div class="big-metric"><span>Horímetro individual</span><strong>'+fmtSec(m.hourmeter_seconds)+'</strong></div>'+
+          '<div class="mini-grid">'+
+            '<div><span>'+(running?"Rodando há":"Parado há")+'</span><strong>'+fmtSec(current)+'</strong></div>'+
+            '<div><span>Partidas / Paradas</span><strong>'+(m.starts_total||0)+' / '+(m.stops_total||0)+'</strong></div>'+
+          '</div></article>';
+      }).join("");
     }
 
-    function timeToMinutes(value) {
-      if (!value || !/^\d{2}:\d{2}$/.test(value)) {
-        return null;
-      }
-
-      const [h, m] =
-        value.split(":").map(Number);
-
-      if (
-        !Number.isInteger(h) ||
-        !Number.isInteger(m) ||
-        h < 0 ||
-        h > 23 ||
-        m < 0 ||
-        m > 59
-      ) {
-        return null;
-      }
-
-      return h * 60 + m;
+    function renderEvents(rows){
+      $("eventsBody").innerHTML=rows.length?rows.map(function(e){
+        return "<tr><td>"+localDateTime(e.event_time||e.received_at)+"</td><td>"+esc(e.motor_id===2?"Correia Transportadora":(e.motor_name||"Sistema"))+
+          "</td><td>"+esc(e.event_type)+"</td><td>"+(e.duration_seconds?fmtSec(e.duration_seconds):"--")+"</td></tr>";
+      }).join(""):'<tr><td colspan="4" class="empty">Sem eventos.</td></tr>';
     }
 
-    function updateScheduleHoursPreview() {
-      const start =
-        timeToMinutes(
-          $("workdayStart").value
-        );
-
-      const end =
-        timeToMinutes(
-          $("workdayEnd").value
-        );
-
-      const breakStart =
-        timeToMinutes(
-          $("breakStart").value
-        );
-
-      const breakEnd =
-        timeToMinutes(
-          $("breakEnd").value
-        );
-
-      const info =
-        $("scheduleHoursPreview");
-
-      if (
-        start === null ||
-        end === null ||
-        breakStart === null ||
-        breakEnd === null ||
-        !(start < breakStart &&
-          breakStart < breakEnd &&
-          breakEnd < end)
-      ) {
-        info.textContent =
-          "Defina uma jornada e um intervalo válidos.";
-
-        return null;
-      }
-
-      const productiveMinutes =
-        (end - start) -
-        (breakEnd - breakStart);
-
-      const productiveHours =
-        productiveMinutes / 60;
-
-      info.textContent =
-        `Pelos horários informados: ${productiveHours.toLocaleString("pt-BR", {
-          minimumFractionDigits: 2,
-          maximumFractionDigits: 2
-        })} h programadas/dia.`;
-
-      return productiveHours;
-    }
-
-    function populateScheduleConfig(config) {
-      if (!config) return;
-
-      const normalizeTime =
-        (value, fallback = "") => {
-          if (!value) return fallback;
-          return String(value).slice(0, 5);
-        };
-
-      $("workdayStart").value =
-        normalizeTime(
-          config.workday_start,
-          "08:00"
-        );
-
-      $("workdayEnd").value =
-        normalizeTime(
-          config.workday_end,
-          "17:30"
-        );
-
-      $("breakStart").value =
-        normalizeTime(
-          config.break_start,
-          ""
-        );
-
-      $("breakEnd").value =
-        normalizeTime(
-          config.break_end,
-          ""
-        );
-
-      $("scheduledHours").value =
-        config.scheduled_hours_per_day ?? 8;
-
-      $("scheduleConfiguredStatus").textContent =
-        config.schedule_configured
-        ? "Configuração ativa"
-        : "Aguardando definição do intervalo";
-
-      $("scheduleConfiguredStatus").className =
-        "schedule-status " +
-        (
-          config.schedule_configured
-          ? "ok-text"
-          : "warning-text"
-        );
-
-      updateScheduleHoursPreview();
-    }
-
-    async function saveScheduleConfig() {
-      const pin =
-        $("operatorPin").value.trim();
-
-      const status =
-        $("scheduleSaveStatus");
-
-      if (!pin) {
-        status.className =
-          "command-status error-text";
-
-        status.textContent =
-          "Informe o PIN do operador no topo da página.";
-
-        return;
-      }
-
-      const productiveHours =
-        updateScheduleHoursPreview();
-
-      if (
-        productiveHours === null
-      ) {
-        status.className =
-          "command-status error-text";
-
-        status.textContent =
-          "Revise os horários da jornada e do intervalo.";
-
-        return;
-      }
-
-      const informedHours =
-        Number(
-          $("scheduledHours").value
-        );
-
-      if (
-        !Number.isFinite(informedHours) ||
-        informedHours <= 0
-      ) {
-        status.className =
-          "command-status error-text";
-
-        status.textContent =
-          "Informe uma quantidade válida de horas por dia.";
-
-        return;
-      }
-
-      status.className =
-        "command-status pending-text";
-
-      status.textContent =
-        "Salvando configuração...";
-
-      try {
-        const response =
-          await fetch(
-            DASHBOARD_URL,
-            {
-              method: "POST",
-
-              headers: {
-                "Content-Type":
-                  "application/json",
-
-                "X-Operator-Pin":
-                  pin
-              },
-
-              body:
-                JSON.stringify(
-                  {
-                    kind:
-                      "save_schedule_config",
-
-                    workday_start:
-                      $("workdayStart").value,
-
-                    workday_end:
-                      $("workdayEnd").value,
-
-                    break_start:
-                      $("breakStart").value,
-
-                    break_end:
-                      $("breakEnd").value,
-
-                    scheduled_hours_per_day:
-                      informedHours
-                  }
-                )
-            }
-          );
-
-        let data = {};
-
-        try {
-          data =
-            await response.json();
-        }
-        catch {
-          // Mantem objeto vazio.
-        }
-
-        if (!response.ok) {
-          const calc =
-            data?.calculated_hours;
-
-          throw new Error(
-            calc !== undefined
-            ? `${data?.error || "Configuração inválida"} Horas calculadas: ${Number(calc).toLocaleString("pt-BR")} h.`
-            : (
-                data?.error ||
-                `HTTP ${response.status}`
-              )
-          );
-        }
-
-        status.className =
-          "command-status success";
-
-        status.textContent =
-          "✓ Jornada salva. A disponibilidade física passará a usar esta configuração.";
-
-        populateScheduleConfig(
-          data.config
-        );
-
-        await loadAnalytics();
-      }
-      catch (err) {
-        console.error(err);
-
-        status.className =
-          "command-status error-text";
-
-        status.textContent =
-          err?.message ||
-          "Falha ao salvar configuração.";
+    async function loadOverview(){
+      const start=$("periodStart").value, end=$("periodEnd").value;
+      if(!start||!end) return;
+      $("managementLoading").textContent="Atualizando indicadores...";
+      try{
+        latestOverview=await mgmt({kind:"overview",start:start,end:end},false);
+        renderOverview(latestOverview);
+        $("managementLoading").textContent="Atualizado agora.";
+      }catch(e){
+        $("managementLoading").textContent="Erro: "+e.message;
       }
     }
 
-    function setupPeriodDefaults() {
-      const today =
-        new Date();
-
-      const start =
-        new Date(today);
-
-      start.setDate(
-        start.getDate() -
-        30
-      );
-
-      $("periodStart").value =
-        localDateInputValue(start);
-
-      $("periodEnd").value =
-        localDateInputValue(today);
+    function renderOverview(data){
+      $("officialHourmeter").textContent=fmtSec(data.official_hourmeter_seconds);
+      $("officialStarted").textContent=data.official_started_at?"Desde "+localDateTime(data.official_started_at):"";
+      $("kpiAvailability").textContent=fmtPct(data.period.availability_percent);
+      $("kpiRunning").textContent=fmtShort(data.period.running_seconds);
+      $("kpiDowntime").textContent=fmtShort(data.period.downtime_seconds);
+      $("kpiProduction").textContent=fmtM3(data.production_summary.total_m3);
+      renderTimeline(data.days||[]);
+      renderPareto(data.pareto||[]);
+      renderComponents(data.components||[]);
+      renderProduction(data);
+      fillReasonOptions(data.reasons||[]);
+      fillMixOptions(data.mix_catalog||[]);
     }
 
-    function updateEquipmentFilter() {
-      const select =
-        $("managementMotor");
+    function renderTimeline(days){
+      const box=$("timelineDays");
+      const active=days.filter(function(d){return d.has_activity;});
+      if(!active.length){ box.innerHTML='<div class="empty">Sem atividade no período.</div>'; return; }
+      box.innerHTML=active.map(function(d){
+        const startMs=new Date(d.detected_start_at).getTime(), endMs=new Date(d.detected_end_at).getTime();
+        const span=Math.max(1,endMs-startMs);
+        const segs=(d.timeline||[]).map(function(s){
+          const a=Math.max(startMs,new Date(s.start_at).getTime());
+          const b=Math.min(endMs,new Date(s.end_at).getTime());
+          const left=Math.max(0,(a-startMs)/span*100), width=Math.max(.3,(b-a)/span*100);
+          const title=(s.type==="RUNNING"?"Produção":s.reason_label)+" · "+localTime(s.start_at)+"–"+localTime(s.end_at)+" · "+fmtShort(s.duration_seconds);
+          const click=s.type==="STOPPED"?' data-stop-key="'+esc(s.segment_key)+'" data-day="'+esc(d.date)+'"':'';
+          return '<button class="timeline-segment '+(s.type==="RUNNING"?"run":"stop")+'" style="left:'+left+'%;width:'+width+'%;background:'+esc(s.color_hex||"#64748b")+'" title="'+esc(title)+'"'+click+'></button>';
+        }).join("");
+        return '<article class="timeline-day card">'+
+          '<div class="timeline-head"><div><strong>'+esc(d.date.split("-").reverse().join("/"))+'</strong>'+
+          '<span>'+localTime(d.detected_start_at)+' → '+localTime(d.detected_end_at)+'</span></div>'+
+          '<div class="day-kpis"><b>'+fmtPct(d.availability_percent)+'</b><span>'+fmtShort(d.running_seconds)+' rodando</span></div></div>'+
+          '<div class="timeline-track">'+segs+'</div>'+
+          '<div class="timeline-foot"><span>Programado: '+fmtShort(d.scheduled_seconds)+'</span><span>Parado: '+fmtShort(d.downtime_seconds)+'</span><span>Refeição: '+fmtShort(d.meal_seconds)+'</span>'+
+          '<button class="link-btn edit-day" data-day="'+esc(d.date)+'">Editar jornada</button></div></article>';
+      }).join("");
 
-      const key =
-        latestEquipment.map(m => `${m.motor_id}:${m.name}`).join("|");
-
-      // So refaz as opcoes quando a lista de equipamentos muda, e nunca
-      // enquanto a caixa estiver em uso (refazer fecharia a lista).
-      if (
-        key === filterKey ||
-        document.activeElement === select
-      ) {
-        return;
-      }
-
-      filterKey =
-        key;
-
-      const atual =
-        select.value;
-
-      select.innerHTML =
-        `<option value="">Todos os equipamentos</option>` +
-        latestEquipment.map(m => `
-          <option value="${m.motor_id}">
-            ${escapeHtml(m.name)}
-          </option>
-        `).join("");
-
-      if (
-        [...select.options]
-          .some(
-            o =>
-              o.value === atual
-          )
-      ) {
-        select.value =
-          atual;
-      }
+      box.querySelectorAll("[data-stop-key]").forEach(function(el){
+        el.addEventListener("click",function(){ openStopEditor(el.dataset.day,el.dataset.stopKey); });
+      });
+      box.querySelectorAll(".edit-day").forEach(function(el){
+        el.addEventListener("click",function(){ openDayEditor(el.dataset.day); });
+      });
     }
 
-    async function loadAnalytics() {
-      const startValue =
-        $("periodStart").value;
+    function openStopEditor(day,key){
+      if(!latestOverview) return;
+      const d=(latestOverview.days||[]).find(function(x){return x.date===day;});
+      const seg=d && (d.timeline||[]).find(function(x){return x.segment_key===key;});
+      if(!seg) return;
+      selectedStop={day:day,seg:seg};
+      $("stopEditor").classList.remove("hidden");
+      $("stopEditorTitle").textContent="Editar parada de "+day.split("-").reverse().join("/");
+      $("stopStart").value=toDateTimeLocal(seg.start_at);
+      $("stopEnd").value=toDateTimeLocal(seg.end_at);
+      $("stopReason").value=seg.reason_code||"UNCLASSIFIED";
+      $("stopNote").value=seg.note||"";
+      $("stopEditor").scrollIntoView({behavior:"smooth",block:"center"});
+    }
 
-      const endValue =
-        $("periodEnd").value;
+    function openDayEditor(day){
+      if(!latestOverview) return;
+      const d=(latestOverview.days||[]).find(function(x){return x.date===day;});
+      if(!d) return;
+      $("dayEditor").classList.remove("hidden");
+      $("dayEditDate").value=day;
+      $("dayStart").value=localTime(d.detected_start_at);
+      $("dayEnd").value=localTime(d.detected_end_at);
+      $("dayEditor").scrollIntoView({behavior:"smooth",block:"center"});
+    }
 
-      if (!startValue || !endValue) {
-        return;
-      }
+    function toDateTimeLocal(v){
+      const d=new Date(v);
+      const parts=new Intl.DateTimeFormat("sv-SE",{timeZone:TZ,year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false}).format(d);
+      return parts.replace(" ","T");
+    }
+    function dtLocalToIso(v){
+      if(!v) return null;
+      return new Date(v+":00-03:00").toISOString();
+    }
 
-      const start =
-        new Date(
-          `${startValue}T00:00:00`
-        );
+    async function saveStop(){
+      if(!selectedStop) return;
+      try{
+        setStatus("Salvando parada...","pending");
+        const seg=selectedStop.seg;
+        await mgmt({
+          kind:"save_stop",
+          operation_date:selectedStop.day,
+          segment_key:seg.segment_key,
+          original_start_at:seg.original_start_at,
+          original_end_at:seg.original_end_at,
+          adjusted_start_at:dtLocalToIso($("stopStart").value),
+          adjusted_end_at:dtLocalToIso($("stopEnd").value),
+          reason_code:$("stopReason").value,
+          note:$("stopNote").value
+        },true);
+        setStatus("Parada atualizada e auditada.","oktxt");
+        $("stopEditor").classList.add("hidden");
+        selectedStop=null;
+        await loadOverview();
+      }catch(e){ setStatus(e.message,"badtext"); }
+    }
 
-      const endInclusive =
-        new Date(
-          `${endValue}T00:00:00`
-        );
+    async function saveDay(){
+      const day=$("dayEditDate").value;
+      if(!day) return;
+      try{
+        setStatus("Salvando jornada...","pending");
+        await mgmt({
+          kind:"save_day",operation_date:day,
+          start_at:new Date(day+"T"+$("dayStart").value+":00-03:00").toISOString(),
+          end_at:new Date(day+"T"+$("dayEnd").value+":00-03:00").toISOString()
+        },true);
+        setStatus("Jornada corrigida e auditada.","oktxt");
+        $("dayEditor").classList.add("hidden");
+        await loadOverview();
+      }catch(e){ setStatus(e.message,"badtext"); }
+    }
 
-      const endExclusive =
-        new Date(endInclusive);
+    function fillReasonOptions(rows){
+      const select=$("stopReason");
+      const current=select.value;
+      select.innerHTML=rows.map(function(r){return '<option value="'+esc(r.reason_code)+'">'+esc(r.label)+(r.is_meal?" · não afeta disponibilidade":"")+'</option>';}).join("");
+      if(current && rows.some(function(r){return r.reason_code===current;})) select.value=current;
+    }
 
-      endExclusive.setDate(
-        endExclusive.getDate() +
-        1
-      );
+    function renderPareto(rows){
+      const labels=rows.map(function(r){return r.label;});
+      const hours=rows.map(function(r){return r.seconds/3600;});
+      const colors=rows.map(function(r){return r.color_hex||"#64748b";});
+      if(paretoChart) paretoChart.destroy();
+      paretoChart=new Chart($("paretoChart"),{
+        type:"bar",
+        data:{labels:labels,datasets:[{label:"Horas",data:hours,backgroundColor:colors}]},
+        options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{beginAtZero:true,ticks:{color:"#9fb0c8"},grid:{color:"#24324a"}},y:{ticks:{color:"#d9e2ef"},grid:{display:false}}}}
+      });
+      $("paretoEmpty").classList.toggle("hidden",rows.length>0);
+    }
 
-      const motorRaw =
-        $("managementMotor").value;
+    function renderComponents(rows){
+      $("componentsGrid").innerHTML=rows.map(function(c){
+        const label=Number(c.motor_id)===2?"Correia Transportadora":c.name;
+        return '<article class="card component-card"><div class="card-head"><h3>'+esc(label)+'</h3><span class="state '+(c.running?"running":"stopped")+'">'+(c.running?"● LIGADO":"● PARADO")+'</span></div>'+
+          '<div class="component-main"><span>Disponibilidade no período</span><strong>'+fmtPct(c.availability_percent)+'</strong></div>'+
+          '<div class="mini-grid"><div><span>Horímetro individual</span><strong>'+fmtSec(c.hourmeter_seconds)+'</strong></div>'+
+          '<div><span>Horas rodadas no período</span><strong>'+fmtShort(c.period_running_seconds)+'</strong></div></div></article>';
+      }).join("");
+    }
 
-      const motorId =
-        motorRaw === ""
-        ? null
-        : Number(motorRaw);
-
-      $("managementMessage").textContent =
-        "Carregando indicadores...";
-
-      try {
-        const response =
-          await fetch(
-            DASHBOARD_URL,
-            {
-              method: "POST",
-              headers: {
-                "Content-Type":
-                  "application/json"
-              },
-              body:
-                JSON.stringify(
-                  {
-                    kind:
-                      "analytics",
-
-                    start:
-                      start.toISOString(),
-
-                    end:
-                      endExclusive.toISOString(),
-
-                    motor_id:
-                      motorId
-                  }
-                )
-            }
-          );
-
-        const data =
-          await response.json();
-
-        if (!response.ok) {
-          throw new Error(
-            data?.error ||
-            `HTTP ${response.status}`
-          );
-        }
-
-        latestAnalytics =
-          data;
-
-        renderAnalytics(
-          data,
-          motorId
-        );
-
-        $("managementMessage").textContent =
-          "Indicadores atualizados.";
-      }
-      catch (err) {
-        console.error(err);
-
-        $("managementMessage").textContent =
-          "Erro ao carregar indicadores: " +
-          (
-            err?.message ||
-            "erro desconhecido"
-          );
+    function fillMixOptions(rows){
+      $("mixOptions").innerHTML=rows.map(function(m){return '<option value="'+esc(m.mix_name)+'"></option>';}).join("");
+      if(!$("mixName").value){
+        const primary=rows.find(function(m){return m.is_primary;});
+        if(primary) $("mixName").value=primary.mix_name;
       }
     }
 
-    function renderAnalytics(
-      data,
-      motorId
-    ) {
-      const equipment =
-        data?.per_equipment || [];
+    function renderProduction(data){
+      $("prodTotal").textContent=fmtM3(data.production_summary.total_m3);
+      $("prodTrucks").textContent=data.production_summary.trucks_count||0;
+      $("prodLoads").textContent=data.production_summary.loads_count||0;
+      $("prodRate").textContent=data.production_summary.m3_per_running_hour==null?"N/D":Number(data.production_summary.m3_per_running_hour).toLocaleString("pt-BR",{maximumFractionDigits:1})+" m³/h";
 
-      const selected =
-        motorId === null
-        ? null
-        : equipment.find(
-            x =>
-              Number(x.motor_id) ===
-              Number(motorId)
-          );
+      const dayMap=new Map((data.days||[]).map(function(d){return [d.date,d];}));
+      const rows=data.production||[];
+      $("productionBody").innerHTML=rows.length?rows.map(function(p){
+        const day=dayMap.get(p.operation_date);
+        return '<tr><td>'+esc(p.operation_date.split("-").reverse().join("/"))+'</td><td>'+esc(p.mix_name)+'</td><td>'+fmtM3(p.volume_m3)+'</td>'+
+          '<td>'+(p.trucks_count==null?"--":p.trucks_count)+'</td><td>'+(p.loads_count==null?"--":p.loads_count)+'</td>'+
+          '<td>'+(day?fmtShort(day.running_seconds):"--")+'</td>'+
+          '<td><button class="small-btn edit-prod" data-id="'+p.id+'">Editar</button> <button class="small-btn danger delete-prod" data-id="'+p.id+'">Excluir</button></td></tr>';
+      }).join(""):'<tr><td colspan="7" class="empty">Ainda não há produção lançada no período.</td></tr>';
 
-      populateScheduleConfig(
-        data?.config
-      );
+      $("productionBody").querySelectorAll(".edit-prod").forEach(function(b){b.addEventListener("click",function(){editProduction(Number(b.dataset.id));});});
+      $("productionBody").querySelectorAll(".delete-prod").forEach(function(b){b.addEventListener("click",function(){deleteProduction(Number(b.dataset.id));});});
 
-      const availabilityConfigured =
-        data?.config?.availability_basis ===
-          "calendar_time" ||
-        (
-          data?.config?.availability_basis ===
-            "scheduled_time" &&
-          data?.config?.schedule_configured ===
-            true
-        );
-
-      if (selected) {
-        $("kpi1Title").textContent =
-          "Disponibilidade física";
-
-        $("kpi1Value").textContent =
-          availabilityConfigured
-          ? fmtPct(selected.availability_percent)
-          : "N/D";
-
-        $("kpi2Title").textContent =
-          "MTBF";
-
-        $("kpi2Value").textContent =
-          fmtHours(selected.mtbf_hours);
-
-        $("kpi3Title").textContent =
-          "MTTR";
-
-        $("kpi3Value").textContent =
-          fmtHours(selected.mttr_hours);
-
-        $("kpi4Title").textContent =
-          "Falhas";
-
-        $("kpi4Value").textContent =
-          selected.failures ?? 0;
-      }
-      else {
-        $("kpi1Title").textContent =
-          "Falhas no período";
-
-        $("kpi1Value").textContent =
-          data?.totals?.failures ?? 0;
-
-        $("kpi2Title").textContent =
-          "Indisponibilidade física";
-
-        $("kpi2Value").textContent =
-          fmtHoursFromSeconds(
-            data?.totals?.physical_downtime_seconds
-          );
-
-        $("kpi3Title").textContent =
-          "Paradas em revisão";
-
-        $("kpi3Value").textContent =
-          data?.data_quality?.episodes_requiring_review ?? 0;
-
-        $("kpi4Title").textContent =
-          "Critério de DF";
-
-        $("kpi4Value").textContent =
-          availabilityConfigured
-          ? (
-              data.config.availability_basis ===
-                "calendar_time"
-              ? "Tempo calendário"
-              : "Tempo programado"
-            )
-          : "Não configurado";
-      }
-
-      $("availabilityNotice").textContent =
-        availabilityConfigured
-        ? (
-            data?.config?.availability_basis ===
-              "scheduled_time"
-            ? "DF calculada somente dentro da jornada programada de segunda a sábado, excluindo o intervalo configurado."
-            : ""
-          )
-        : "A disponibilidade física oficial permanece bloqueada até salvarmos a jornada e o intervalo no painel.";
-
-      renderReasonCharts(
-        data?.by_reason || []
-      );
-
-      renderEquipmentMetrics(
-        equipment
-      );
-
-      renderEpisodes(
-        data?.episodes || []
-      );
+      const byDay={};
+      rows.forEach(function(p){byDay[p.operation_date]=(byDay[p.operation_date]||0)+Number(p.volume_m3||0);});
+      const labels=Object.keys(byDay).sort(), vals=labels.map(function(k){return byDay[k];});
+      if(productionChart) productionChart.destroy();
+      productionChart=new Chart($("productionChart"),{
+        type:"bar",data:{labels:labels.map(function(x){return x.slice(8,10)+"/"+x.slice(5,7);}),datasets:[{label:"m³",data:vals}]},
+        options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:"#d9e2ef"},grid:{display:false}},y:{beginAtZero:true,ticks:{color:"#9fb0c8"},grid:{color:"#24324a"}}}}
+      });
     }
 
-    function renderReasonCharts(rows) {
-      const labels =
-        rows.map(
-          r =>
-            r.label
-        );
-
-      const counts =
-        rows.map(
-          r =>
-            Number(
-              r.interventions || 0
-            )
-        );
-
-      const hours =
-        rows.map(
-          r =>
-            Number(
-              r.downtime_seconds || 0
-            ) /
-            3600
-        );
-
-      const labelToCode = {};
-      REASONS.forEach(r => { labelToCode[r.label] = r.code; });
-
-      const colors =
-        rows.map(r => {
-          const code =
-            r.reason_code ?? labelToCode[r.label];
-          return GROUP_COLORS[reasonGroupOf(code)];
-        });
-
-      if (chartReasonsCount) {
-        chartReasonsCount.destroy();
-      }
-
-      if (chartReasonsTime) {
-        chartReasonsTime.destroy();
-      }
-
-      chartReasonsCount =
-        new Chart(
-          $("chartReasonCount"),
-          {
-            type: "bar",
-            data: {
-              labels,
-              datasets: [
-                {
-                  label:
-                    "Intervenções",
-                  data:
-                    counts,
-                  backgroundColor:
-                    colors,
-                  borderRadius:
-                    5
-                }
-              ]
-            },
-            options: {
-              responsive: true,
-              maintainAspectRatio: false,
-              plugins: {
-                legend: {
-                  display: false
-                }
-              },
-              scales: {
-                y: {
-                  beginAtZero: true,
-                  ticks: {
-                    precision: 0
-                  }
-                }
-              }
-            }
-          }
-        );
-
-      chartReasonsTime =
-        new Chart(
-          $("chartReasonTime"),
-          {
-            type: "bar",
-            data: {
-              labels,
-              datasets: [
-                {
-                  label:
-                    "Horas",
-                  data:
-                    hours,
-                  backgroundColor:
-                    colors,
-                  borderRadius:
-                    5
-                }
-              ]
-            },
-            options: {
-              responsive: true,
-              maintainAspectRatio: false,
-              indexAxis: "y",
-              plugins: {
-                legend: {
-                  display: false
-                }
-              },
-              scales: {
-                x: {
-                  beginAtZero: true
-                }
-              }
-            }
-          }
-        );
+    function editProduction(id){
+      const p=(latestOverview.production||[]).find(function(x){return Number(x.id)===id;});
+      if(!p) return;
+      productionEditId=id;
+      $("productionDate").value=p.operation_date;
+      $("mixName").value=p.mix_name;
+      $("volumeM3").value=p.volume_m3;
+      $("trucksCount").value=p.trucks_count==null?"":p.trucks_count;
+      $("loadsCount").value=p.loads_count==null?"":p.loads_count;
+      $("productionNote").value=p.note||"";
+      $("productionFormTitle").textContent="Editar produção";
+      $("cancelProductionEdit").classList.remove("hidden");
+      $("productionForm").scrollIntoView({behavior:"smooth"});
     }
 
-    function renderEquipmentMetrics(rows) {
-      const tbody =
-        $("metricsBody");
-
-      if (!rows?.length) {
-        tbody.innerHTML =
-          `<tr><td colspan="8" class="empty">Sem dados oficiais no período.</td></tr>`;
-
-        return;
-      }
-
-      tbody.innerHTML =
-        rows.map(m => `
-          <tr>
-            <td>${escapeHtml(m.name)}</td>
-            <td>${fmtHoursFromSeconds(m.runtime_seconds)}</td>
-            <td>${m.failures ?? 0}</td>
-            <td>${fmtHoursFromSeconds(m.physical_downtime_seconds)}</td>
-            <td>${fmtPct(m.availability_percent)}</td>
-            <td>${fmtHours(m.mtbf_hours)}</td>
-            <td>${fmtHours(m.mttr_hours)}</td>
-            <td>${m.closed_failures ?? 0}</td>
-          </tr>
-        `).join("");
+    function clearProductionForm(){
+      productionEditId=null;
+      $("productionFormTitle").textContent="Adicionar produção";
+      $("productionDate").value=localDate();
+      $("volumeM3").value="";
+      $("trucksCount").value="";
+      $("loadsCount").value="";
+      $("productionNote").value="";
+      $("cancelProductionEdit").classList.add("hidden");
+      const primary=(latestOverview?.mix_catalog||[]).find(function(m){return m.is_primary;});
+      $("mixName").value=primary?primary.mix_name:"Pavimento Rígido";
     }
 
-    function renderEpisodes(rows) {
-      const tbody =
-        $("episodesBody");
-
-      if (!rows?.length) {
-        tbody.innerHTML =
-          `<tr><td colspan="9" class="empty">Nenhuma parada oficial de produção no período.</td></tr>`;
-
-        return;
-      }
-
-      tbody.innerHTML =
-        rows.map(ep => `
-          <tr>
-            <td>${fmtDate(ep.started_at)}</td>
-            <td>${escapeHtml(ep.display_name || "--")}</td>
-            <td>${fmtDate(ep.ended_at)}</td>
-            <td>${fmtHoursFromSeconds(ep.duration_seconds)}</td>
-            <td>${escapeHtml(ep.reason_label || "Não classificada")}</td>
-            <td>${escapeHtml(ep.reason_detail || "--")}</td>
-            <td>${escapeHtml(ep.work_order || "--")}</td>
-            <td>${ep.counts_as_failure ? "Sim" : "Não"}</td>
-            <td>${escapeHtml(ep.status || "--")}</td>
-          </tr>
-        `).join("");
+    async function saveProduction(){
+      try{
+        setStatus("Salvando produção...","pending");
+        await mgmt({
+          kind:"save_production",id:productionEditId,
+          operation_date:$("productionDate").value,
+          mix_name:$("mixName").value,
+          volume_m3:Number($("volumeM3").value),
+          trucks_count:$("trucksCount").value===""?null:Number($("trucksCount").value),
+          loads_count:$("loadsCount").value===""?null:Number($("loadsCount").value),
+          note:$("productionNote").value
+        },true);
+        setStatus("Produção salva.","oktxt");
+        clearProductionForm();
+        await loadOverview();
+      }catch(e){setStatus(e.message,"badtext");}
     }
 
-    function exportAnalyticsCsv() {
-      const rows =
-        latestAnalytics?.episodes || [];
-
-      if (!rows.length) {
-        $("managementMessage").textContent =
-          "Não há episódios para exportar.";
-
-        return;
-      }
-
-      const header = [
-        "Inicio",
-        "Fim",
-        "Equipamento",
-        "Grupo",
-        "Duracao_h",
-        "Motivo",
-        "Categoria",
-        "Detalhe",
-        "Componente",
-        "Modo_falha",
-        "OS",
-        "Conta_como_falha",
-        "Status"
-      ];
-
-      const csvRows =
-        [
-          header,
-          ...rows.map(ep => [
-            ep.started_at || "",
-            ep.ended_at || "",
-            ep.display_name || "",
-            ep.group_name || "",
-            ep.duration_seconds === null ||
-            ep.duration_seconds === undefined
-              ? ""
-              : (
-                  Number(ep.duration_seconds) /
-                  3600
-                ).toFixed(4),
-            ep.reason_label || "",
-            ep.reason_category || "",
-            ep.reason_detail || "",
-            ep.failure_component || "",
-            ep.failure_mode || "",
-            ep.work_order || "",
-            ep.counts_as_failure ? "Sim" : "Não",
-            ep.status || ""
-          ])
-        ];
-
-      const csv =
-        csvRows
-          .map(
-            row =>
-              row.map(
-                value =>
-                  `"${String(value).replaceAll('"','""')}"`
-              ).join(";")
-          )
-          .join("\r\n");
-
-      const blob =
-        new Blob(
-          [
-            "\uFEFF" +
-            csv
-          ],
-          {
-            type:
-              "text/csv;charset=utf-8"
-          }
-        );
-
-      const url =
-        URL.createObjectURL(blob);
-
-      const a =
-        document.createElement("a");
-
-      a.href =
-        url;
-
-      a.download =
-        `UC0012_paradas_${$("periodStart").value}_${$("periodEnd").value}.csv`;
-
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-
-      URL.revokeObjectURL(url);
+    async function deleteProduction(id){
+      if(!confirm("Excluir este lançamento de produção?")) return;
+      try{
+        await mgmt({kind:"delete_production",id:id},true);
+        setStatus("Lançamento excluído.","oktxt");
+        await loadOverview();
+      }catch(e){setStatus(e.message,"badtext");}
     }
 
-    function setTab(tab) {
-      document
-        .querySelectorAll(".tab-button")
-        .forEach(
-          b =>
-            b.classList.toggle(
-              "active",
-              b.dataset.tab === tab
-            )
-        );
-
-      document
-        .querySelectorAll(".tab-page")
-        .forEach(
-          p =>
-            p.classList.toggle(
-              "active",
-              p.id ===
-                `tab-${tab}`
-            )
-        );
-
-      if (tab === "management") {
-        updateEquipmentFilter();
-
-        if (!latestAnalytics) {
-          loadAnalytics();
-        }
-      }
+    function switchTab(name){
+      document.querySelectorAll(".tab-btn").forEach(function(b){b.classList.toggle("active",b.dataset.tab===name);});
+      document.querySelectorAll(".tab-page").forEach(function(p){p.classList.toggle("active",p.id==="tab-"+name);});
+      if(name!=="operation") loadOverview();
     }
 
-    window.addEventListener(
-      "DOMContentLoaded",
-      () => {
-        setupPeriodDefaults();
+    document.querySelectorAll(".tab-btn").forEach(function(b){b.addEventListener("click",function(){switchTab(b.dataset.tab);});});
+    document.querySelectorAll(".period-btn").forEach(function(b){b.addEventListener("click",function(){applyQuickPeriod(b.dataset.mode);});});
+    $("applyPeriod").addEventListener("click",function(){periodMode="custom";loadOverview();});
+    $("refreshBtn").addEventListener("click",async function(){await Promise.all([loadLive(),loadOverview()]);});
+    $("saveStop").addEventListener("click",saveStop);
+    $("cancelStop").addEventListener("click",function(){$("stopEditor").classList.add("hidden");selectedStop=null;});
+    $("saveDay").addEventListener("click",saveDay);
+    $("cancelDay").addEventListener("click",function(){$("dayEditor").classList.add("hidden");});
+    $("saveProduction").addEventListener("click",saveProduction);
+    $("cancelProductionEdit").addEventListener("click",clearProductionForm);
 
-        loadDashboard();
-
-        setInterval(
-          async () => {
-            await loadDashboard();
-
-            if (
-              $("tab-management")
-                .classList
-                .contains("active")
-            ) {
-              updateEquipmentFilter();
-            }
-          },
-          3000
-        );
-
-        $("refreshBtn")
-          .addEventListener(
-            "click",
-            loadDashboard
-          );
-
-        $("loadManagement")
-          .addEventListener(
-            "click",
-            loadAnalytics
-          );
-
-        $("exportCsv")
-          .addEventListener(
-            "click",
-            exportAnalyticsCsv
-          );
-
-        $("saveSchedule")
-          .addEventListener(
-            "click",
-            saveScheduleConfig
-          );
-
-        [
-          "workdayStart",
-          "workdayEnd",
-          "breakStart",
-          "breakEnd"
-        ].forEach(
-          id =>
-            $(id).addEventListener(
-              "change",
-              updateScheduleHoursPreview
-            )
-        );
-
-        document
-          .querySelectorAll(".tab-button")
-          .forEach(
-            button =>
-              button.addEventListener(
-                "click",
-                () =>
-                  setTab(
-                    button.dataset.tab
-                  )
-              )
-          );
-      }
-    );
+    const today=localDate();
+    $("periodStart").value=today; $("periodEnd").value=today; $("productionDate").value=today;
+    await Promise.all([loadLive(),loadOverview()]);
+    setInterval(loadLive,5000);
+    setInterval(function(){if(document.visibilityState==="visible") loadOverview();},30000);
   </script>
-
   <style>
-    :root{
-      --bg:#0b1220;
-      --panel:#111b2e;
-      --panel2:#17233a;
-      --border:#253550;
-      --text:#f4f7fb;
-      --muted:#8fa1bd;
-      --blue:#2f80ed;
-      --green:#30c878;
-      --red:#ef5b5b;
-      --yellow:#f6bd41;
-    }
-
-    *{
-      box-sizing:border-box
-    }
-
-    body{
-      margin:0;
-      background:
-        linear-gradient(
-          180deg,
-          #09101d,
-          #0d1626 45%,
-          #0b1220
-        );
-      color:var(--text);
-      font-family:
-        Inter,
-        Arial,
-        Helvetica,
-        sans-serif;
-      min-height:100vh
-    }
-
-    .wrap{
-      max-width:1480px;
-      margin:auto;
-      padding:22px
-    }
-
-    .topbar{
-      display:flex;
-      justify-content:space-between;
-      align-items:center;
-      gap:16px;
-      flex-wrap:wrap;
-      margin-bottom:16px
-    }
-
-    h1{
-      font-size:28px;
-      margin:0 0 5px
-    }
-
-    h2{
-      font-size:18px
-    }
-
-    .subtitle,
-    .small{
-      color:var(--muted);
-      font-size:13px
-    }
-
-    .top-actions{
-      display:flex;
-      gap:10px;
-      align-items:center;
-      flex-wrap:wrap
-    }
-
-    .pin-box{
-      display:flex;
-      align-items:center;
-      gap:8px;
-      background:var(--panel);
-      border:1px solid var(--border);
-      border-radius:10px;
-      padding:7px 10px
-    }
-
-    .pin-box label{
-      font-size:12px;
-      color:var(--muted)
-    }
-
-    .pin-box input{
-      width:125px
-    }
-
-    input,
-    select{
-      background:#0d1728;
-      color:var(--text);
-      border:1px solid var(--border);
-      border-radius:8px;
-      padding:9px 10px;
-      outline:none
-    }
-
-    .status-pill{
-      border-radius:999px;
-      padding:10px 14px;
-      font-weight:800;
-      font-size:13px
-    }
-
-    .online{
-      background:rgba(48,200,120,.14);
-      color:var(--green);
-      border:1px solid rgba(48,200,120,.4)
-    }
-
-    .offline{
-      background:rgba(239,91,91,.13);
-      color:var(--red);
-      border:1px solid rgba(239,91,91,.38)
-    }
-
-    button{
-      border:1px solid var(--border);
-      background:var(--panel2);
-      color:white;
-      padding:10px 14px;
-      border-radius:9px;
-      cursor:pointer;
-      font-weight:700
-    }
-
-    button:hover{
-      filter:brightness(1.12)
-    }
-
-    button.primary{
-      background:var(--blue);
-      border-color:transparent
-    }
-
-    .tabs{
-      display:flex;
-      gap:8px;
-      margin:0 0 18px;
-      flex-wrap:wrap
-    }
-
-    .tab-button.active{
-      background:var(--blue);
-      border-color:transparent
-    }
-
-    .tab-page{
-      display:none
-    }
-
-    .tab-page.active{
-      display:block
-    }
-
-    .error{
-      background:rgba(239,91,91,.12);
-      border:1px solid rgba(239,91,91,.35);
-      color:#ffd7d7;
-      padding:12px 14px;
-      border-radius:10px;
-      margin-bottom:16px
-    }
-
-    .hidden{
-      display:none
-    }
-
-    .summary-grid{
-      display:grid;
-      grid-template-columns:
-        repeat(
-          auto-fit,
-          minmax(190px,1fr)
-        );
-      gap:12px;
-      margin-bottom:18px
-    }
-
-    .summary{
-      background:rgba(17,27,46,.94);
-      border:1px solid var(--border);
-      border-radius:12px;
-      padding:15px
-    }
-
-    .summary span{
-      display:block;
-      color:var(--muted);
-      font-size:12px;
-      margin-bottom:7px
-    }
-
-    .summary .value{
-      font-weight:800;
-      font-size:17px;
-      overflow-wrap:anywhere
-    }
-
-    .ok-text{
-      color:var(--green)
-    }
-
-    .warning-text{
-      color:var(--yellow)
-    }
-
-    .error-text{
-      color:var(--red)
-    }
-
-    .pending-text{
-      color:var(--yellow)
-    }
-
-    .success{
-      color:var(--green)
-    }
-
-    .section-title{
-      margin:24px 0 12px;
-      font-size:18px
-    }
-
-    .equipment-grid{
-      display:grid;
-      grid-template-columns:
-        repeat(
-          auto-fit,
-          minmax(310px,1fr)
-        );
-      gap:14px
-    }
-
-    .card{
-      background:rgba(17,27,46,.96);
-      border:1px solid var(--border);
-      border-radius:14px;
-      padding:17px;
-      box-shadow:
-        0 8px 30px rgba(0,0,0,.13)
-    }
-
-    .card-head{
-      display:flex;
-      justify-content:space-between;
-      align-items:flex-start;
-      gap:12px
-    }
-
-    .equipment-name{
-      font-size:18px;
-      font-weight:800
-    }
-
-    .state{
-      font-size:12px;
-      font-weight:900;
-      border-radius:999px;
-      padding:7px 9px;
-      white-space:nowrap
-    }
-
-    .running{
-      color:var(--green);
-      background:rgba(48,200,120,.12)
-    }
-
-    .stopped{
-      color:var(--red);
-      background:rgba(239,91,91,.11)
-    }
-
-    .metric-primary{
-      margin:17px 0;
-      background:#0d1728;
-      border-radius:10px;
-      padding:14px
-    }
-
-    .metric-primary span,
-    .metric-grid span,
-    .stop-reason span{
-      display:block;
-      color:var(--muted);
-      font-size:11px;
-      text-transform:uppercase;
-      letter-spacing:.4px
-    }
-
-    .metric-primary strong{
-      display:block;
-      font-size:25px;
-      margin:6px 0 3px
-    }
-
-    .metric-primary small{
-      color:#aab8cc
-    }
-
-    .metric-grid{
-      display:grid;
-      grid-template-columns:1fr 1fr;
-      gap:9px
-    }
-
-    .metric-grid>div{
-      background:#0d1728;
-      border-radius:9px;
-      padding:11px
-    }
-
-    .metric-grid strong{
-      display:block;
-      margin-top:5px;
-      font-size:14px
-    }
-
-    .stop-reason{
-      margin-top:10px;
-      border-left:3px solid var(--yellow);
-      background:rgba(246,189,65,.07);
-      border-radius:8px;
-      padding:10px 12px
-    }
-
-    .stop-reason strong{
-      display:block;
-      margin-top:4px
-    }
-
-    .reason-editor{
-      display:grid;
-      gap:8px;
-      margin-top:12px;
-      padding-top:12px;
-      border-top:1px solid var(--border)
-    }
-
-    .reason-editor label{
-      color:var(--muted);
-      font-size:12px
-    }
-
-    .command-status{
-      min-height:18px;
-      font-size:12px
-    }
-
-    /* Justificativa sem lista suspensa */
-    .equipment-card.needs-reason{
-      border-color:rgba(246,189,65,.65)
-    }
-
-    .unclassified{
-      color:var(--yellow);
-      background:rgba(246,189,65,.13)
-    }
-
-    .reason-group{
-      margin-top:10px
-    }
-
-    .reason-group-title{
-      color:var(--muted);
-      font-size:11px;
-      font-weight:800;
-      text-transform:uppercase;
-      letter-spacing:.4px;
-      margin-bottom:6px
-    }
-
-    .reason-options{
-      display:grid;
-      grid-template-columns:repeat(auto-fill,minmax(130px,1fr));
-      gap:7px
-    }
-
-    .reason-opt{
-      text-align:left;
-      font-weight:600;
-      line-height:1.25;
-      min-height:48px;
-      background:#0d1728;
-      border:2px solid var(--border);
-      border-left-width:6px;
-      touch-action:manipulation;
-      -webkit-tap-highlight-color:transparent
-    }
-
-    .reason-opt[data-g="ope"]{ border-left-color:#2f80ed }
-    .reason-opt[data-g="pre"]{ border-left-color:#a855f7 }
-    .reason-opt[data-g="tec"]{ border-left-color:#ef5b5b }
-    .reason-opt[data-g="out"]{ border-left-color:#8fa1bd }
-
-    .reason-opt.selected{
-      background:#1d4ed8;
-      border-color:#93c5fd;
-      color:#fff
-    }
-
-    .reason-opt.selected::after{
-      content:" ✓"
-    }
-
-    .reason-opt:disabled,
-    .reason-actions button:disabled{
-      opacity:.55;
-      cursor:default;
-      filter:none
-    }
-
-    .reason-actions{
-      display:grid;
-      grid-template-columns:2fr 1fr;
-      gap:8px;
-      margin-top:12px
-    }
-
-    .chart-legend{
-      display:flex;
-      flex-wrap:wrap;
-      gap:12px;
-      font-size:12px;
-      color:#c7d2e3;
-      margin:8px 0 2px
-    }
-
-    .chart-legend span{
-      display:inline-flex;
-      align-items:center;
-      gap:6px
-    }
-
-    .chart-legend span::before{
-      content:"";
-      width:10px;
-      height:10px;
-      border-radius:3px;
-      background:var(--c)
-    }
-
-    .filters{
-      display:flex;
-      gap:10px;
-      flex-wrap:wrap;
-      align-items:flex-end;
-      margin-bottom:14px
-    }
-
-    .filter-group{
-      display:grid;
-      gap:5px
-    }
-
-    .filter-group label{
-      color:var(--muted);
-      font-size:12px
-    }
-
-    .schedule-card{
-      margin-bottom:15px
-    }
-
-    .schedule-topline{
-      display:flex;
-      justify-content:space-between;
-      align-items:flex-start;
-      gap:14px;
-      flex-wrap:wrap;
-      margin-bottom:14px
-    }
-
-    .schedule-status{
-      font-size:12px;
-      font-weight:800;
-      border:1px solid var(--border);
-      border-radius:999px;
-      padding:7px 10px
-    }
-
-    .schedule-grid{
-      display:grid;
-      grid-template-columns:
-        repeat(
-          auto-fit,
-          minmax(155px,1fr)
-        );
-      gap:10px;
-      align-items:end
-    }
-
-    .schedule-save{
-      display:flex;
-      align-items:end
-    }
-
-    .schedule-save button{
-      width:100%
-    }
-
-    .kpi-grid{
-      display:grid;
-      grid-template-columns:
-        repeat(
-          auto-fit,
-          minmax(200px,1fr)
-        );
-      gap:12px;
-      margin-bottom:15px
-    }
-
-    .kpi{
-      background:var(--panel);
-      border:1px solid var(--border);
-      border-radius:13px;
-      padding:16px
-    }
-
-    .kpi span{
-      color:var(--muted);
-      font-size:12px
-    }
-
-    .kpi strong{
-      display:block;
-      margin-top:8px;
-      font-size:25px
-    }
-
-    .notice{
-      background:rgba(246,189,65,.08);
-      border:1px solid rgba(246,189,65,.25);
-      color:#f4d999;
-      padding:11px 13px;
-      border-radius:10px;
-      margin-bottom:14px
-    }
-
-    .chart-grid{
-      display:grid;
-      grid-template-columns:
-        repeat(
-          auto-fit,
-          minmax(360px,1fr)
-        );
-      gap:14px
-    }
-
-    .chart-box{
-      height:340px
-    }
-
-    .table-card{
-      overflow-x:auto
-    }
-
-    table{
-      width:100%;
-      border-collapse:collapse;
-      min-width:900px
-    }
-
-    th,
-    td{
-      padding:11px 10px;
-      border-bottom:1px solid var(--border);
-      text-align:left;
-      font-size:13px
-    }
-
-    th{
-      color:var(--muted);
-      font-size:11px;
-      text-transform:uppercase
-    }
-
-    .event-tag{
-      font-size:11px;
-      font-weight:800;
-      background:#1d2d49;
-      padding:5px 7px;
-      border-radius:6px
-    }
-
-    .footer{
-      color:var(--muted);
-      font-size:12px;
-      text-align:center;
-      padding:22px 0 5px
-    }
-
-    .empty{
-      color:var(--muted);
-      padding:20px
-    }
-
-    @media(max-width:650px){
-      .wrap{
-        padding:14px
-      }
-
-      h1{
-        font-size:23px
-      }
-
-      .metric-grid{
-        grid-template-columns:1fr
-      }
-
-      .equipment-grid{
-        grid-template-columns:1fr
-      }
-
-      .chart-grid{
-        grid-template-columns:1fr
-      }
-
-      .chart-box{
-        height:300px
-      }
-    }
+    :root{--bg:#07111f;--panel:#101c2d;--panel2:#0c1727;--border:#263750;--text:#eef4fb;--muted:#93a4bc;--blue:#2f80ed;--green:#30c878;--red:#ef5b5b;--yellow:#f6bd41}
+    *{box-sizing:border-box}body{margin:0;background:linear-gradient(180deg,#07111f,#0a1423 45%,#08111e);color:var(--text);font-family:Inter,Segoe UI,Arial,sans-serif}
+    button,input,select,textarea{font:inherit}button{cursor:pointer}.wrap{max-width:1480px;margin:auto;padding:20px}.topbar{display:flex;justify-content:space-between;gap:18px;align-items:flex-start;margin-bottom:18px}.brand h1{margin:0 0 5px;font-size:28px}.muted,.small{color:var(--muted);font-size:12px}.top-actions{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;justify-content:flex-end}.pin-box{display:grid;gap:4px}.pin-box input{width:110px}
+    input,select,textarea{background:#0b1728;color:var(--text);border:1px solid var(--border);border-radius:9px;padding:9px 10px}textarea{min-height:70px;resize:vertical}button{border:1px solid var(--border);background:#17253a;color:var(--text);border-radius:9px;padding:9px 12px;font-weight:700}button:hover{filter:brightness(1.12)}button.primary{background:#1f67d2;border-color:#3983ed}.pill{border-radius:999px;padding:8px 10px;font-size:12px;font-weight:900}.pill.ok{background:rgba(48,200,120,.14);color:#6ee7a6}.pill.bad{background:rgba(239,91,91,.13);color:#ff9999}
+    .tabs{display:flex;gap:8px;overflow:auto;border-bottom:1px solid var(--border);margin-bottom:18px}.tab-btn{border-radius:9px 9px 0 0;background:transparent;border-bottom:0;color:var(--muted);padding:11px 16px;white-space:nowrap}.tab-btn.active{background:var(--panel);color:white;border-color:var(--border)}.tab-page{display:none}.tab-page.active{display:block}.hidden{display:none!important}.error{background:rgba(239,91,91,.12);border:1px solid rgba(239,91,91,.4);padding:12px;border-radius:10px;margin-bottom:12px}
+    .hero-grid,.summary-grid,.kpi-grid,.equipment-grid,.components-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px}.card{background:rgba(16,28,45,.96);border:1px solid var(--border);border-radius:14px;padding:15px}.official{background:linear-gradient(135deg,#15345f,#10223d);border-color:#315d91}.official span,.summary span,.kpi span,.big-metric span,.mini-grid span,.component-main span{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.45px}.official strong{display:block;font-size:31px;margin:8px 0}.summary strong,.kpi strong{display:block;font-size:24px;margin-top:8px}.section-title{margin:24px 0 12px;font-size:18px}.card-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}.card-head h3{margin:0 0 5px}.state{font-size:11px;font-weight:900;padding:7px 9px;border-radius:999px;white-space:nowrap}.state.running{background:rgba(48,200,120,.13);color:#66e5a0}.state.stopped{background:rgba(239,91,91,.1);color:#ff9b9b}.big-metric{background:#0b1625;border-radius:10px;padding:13px;margin:15px 0}.big-metric strong{display:block;font-size:23px;margin-top:6px}.mini-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}.mini-grid>div{background:#0b1625;padding:10px;border-radius:9px}.mini-grid strong{display:block;margin-top:5px;font-size:14px}
+    .table-card{overflow:auto}table{width:100%;border-collapse:collapse;min-width:720px}th,td{text-align:left;padding:10px;border-bottom:1px solid var(--border);font-size:13px}th{font-size:11px;color:var(--muted);text-transform:uppercase}.empty{color:var(--muted);padding:18px}.filters{display:flex;gap:9px;align-items:flex-end;flex-wrap:wrap}.filter{display:grid;gap:5px}.period-pills{display:flex;gap:6px;flex-wrap:wrap}.period-btn.active{background:#1f67d2;border-color:#3d88f3}.management-top{display:flex;justify-content:space-between;gap:12px;align-items:end;flex-wrap:wrap}.management-status{color:var(--muted);font-size:12px;margin-top:8px}
+    .timeline-day{margin-bottom:10px}.timeline-head,.timeline-foot{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap}.timeline-head>div:first-child{display:flex;gap:10px;align-items:baseline}.timeline-head span,.timeline-foot{font-size:12px;color:var(--muted)}.day-kpis{display:flex;gap:12px;align-items:center}.day-kpis b{font-size:18px;color:#8fc1ff}.timeline-track{position:relative;height:42px;background:#091321;border-radius:8px;margin:12px 0;overflow:hidden}.timeline-segment{position:absolute;top:0;height:100%;border:0;border-radius:0;padding:0;min-width:2px}.timeline-segment.stop{cursor:pointer}.timeline-segment.stop:hover{outline:2px solid white;z-index:2}.timeline-foot{justify-content:flex-start}.timeline-foot span{margin-right:10px}.link-btn{padding:4px 8px;background:transparent;color:#82b6ff}
+    .editor{margin-top:12px;border:1px solid #3a5375;background:#0d1b2d}.editor-grid,.production-form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px}.editor-actions{display:flex;gap:8px;margin-top:12px}.save-status{min-height:20px;font-size:12px;margin-top:9px}.save-status.pending{color:var(--yellow)}.save-status.oktxt{color:#67dda0}.save-status.badtext{color:#ff9696}.chart-card{height:380px}.chart-wrap{height:315px}.pareto-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(280px,1fr);gap:12px}.legend-note{line-height:1.5}
+    .component-main{background:#0b1625;border-radius:10px;padding:13px;margin:14px 0}.component-main strong{display:block;font-size:28px;margin-top:6px}.production-summary{margin-bottom:12px}.small-btn{padding:5px 8px;font-size:11px}.small-btn.danger{color:#ff9b9b}.production-layout{display:grid;grid-template-columns:minmax(320px,.8fr) minmax(0,1.2fr);gap:12px}.footer{text-align:center;color:var(--muted);font-size:11px;padding:24px}
+    @media(max-width:800px){.wrap{padding:12px}.topbar{display:block}.top-actions{justify-content:flex-start;margin-top:12px}.brand h1{font-size:23px}.pareto-grid,.production-layout{grid-template-columns:1fr}.mini-grid{grid-template-columns:1fr}.official strong{font-size:26px}.timeline-head{align-items:flex-start}.timeline-track{height:48px}}
   </style>
 </head>
-
 <body>
-  <main class="wrap">
-    <div class="topbar">
-      <div>
-        <h1>UC 0012 — Horímetros e Gestão</h1>
-        <div class="subtitle">
-          Monitoramento remoto HF-006
-        </div>
-      </div>
+<main class="wrap">
+  <header class="topbar">
+    <div class="brand"><h1>UC 0012 — Operação e Gestão</h1><div class="muted">HF-006 · monitoramento operacional da usina de concreto</div></div>
+    <div class="top-actions">
+      <div class="pin-box"><label class="small" for="operatorPin">PIN para alterações</label><input id="operatorPin" type="password" autocomplete="off" placeholder="PIN"></div>
+      <div><div id="cloudStatus" class="pill bad">● HF-006 OFFLINE</div><div id="lastSeen" class="small" style="margin-top:5px">Sem atualização</div></div>
+      <button id="refreshBtn">Atualizar</button>
+    </div>
+  </header>
 
-      <div class="top-actions">
-        <div class="pin-box">
-          <label for="operatorPin">
-            PIN para justificativas
-          </label>
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="operation">Operação</button>
+    <button class="tab-btn" data-tab="management">Gestão</button>
+    <button class="tab-btn" data-tab="components">Componentes</button>
+    <button class="tab-btn" data-tab="production">Produção</button>
+  </nav>
 
-          <input
-            id="operatorPin"
-            type="password"
-            autocomplete="off"
-            placeholder="PIN"
-          />
-        </div>
+  <div id="saveStatus" class="save-status"></div>
 
+  <section id="tab-operation" class="tab-page active">
+    <div id="liveError" class="error hidden"></div>
+    <section class="hero-grid">
+      <article class="card official"><span>Horímetro Oficial UC 0012</span><strong id="officialHourmeter">--</strong><div id="officialStarted" class="small"></div><div class="small" style="margin-top:8px">Acumulativo da usina para manutenção preventiva. Conta quando Misturador A OU B está operando, sem duplicar sobreposição.</div></article>
+      <article class="card summary"><span>Firmware</span><strong id="firmware">--</strong></article>
+      <article class="card summary"><span>Sinal Wi-Fi</span><strong id="wifiRssi">--</strong></article>
+      <article class="card summary"><span>Eventos pendentes</span><strong id="pendingEvents">--</strong></article>
+    </section>
+
+    <h2 class="section-title">Equipamentos em uso</h2>
+    <section id="equipmentGrid" class="equipment-grid"></section>
+
+    <h2 class="section-title">Últimos eventos</h2>
+    <section class="card table-card">
+      <table><thead><tr><th>Horário</th><th>Equipamento</th><th>Evento</th><th>Duração ligada</th></tr></thead><tbody id="eventsBody"></tbody></table>
+    </section>
+  </section>
+
+  <section id="tab-management" class="tab-page">
+    <article class="card">
+      <div class="management-top">
         <div>
-          <div
-            id="cloudStatus"
-            class="status-pill offline"
-          >
-            ● HF-006 OFFLINE
-          </div>
-
-          <div
-            id="lastSeen"
-            class="small"
-            style="margin-top:6px;text-align:right"
-          >
-            Sem atualização
+          <div class="period-pills">
+            <button class="period-btn active" data-mode="today">Hoje</button>
+            <button class="period-btn" data-mode="week">Semana</button>
+            <button class="period-btn" data-mode="month">Mês</button>
           </div>
         </div>
-
-        <button id="refreshBtn">
-          Atualizar
-        </button>
-      </div>
-    </div>
-
-    <div class="tabs">
-      <button
-        class="tab-button active"
-        data-tab="operation"
-      >
-        Operação
-      </button>
-
-      <button
-        class="tab-button"
-        data-tab="management"
-      >
-        Gestão
-      </button>
-
-      <button
-        class="tab-button"
-        data-tab="system"
-      >
-        Sistema
-      </button>
-    </div>
-
-    <div
-      id="errorBox"
-      class="error hidden"
-    ></div>
-
-    <section
-      id="tab-operation"
-      class="tab-page active"
-    >
-      <div
-        id="queueNotice"
-        class="notice hidden"
-      ></div>
-
-      <section class="summary-grid">
-        <div class="summary">
-          <span>Modo</span>
-          <div id="mode" class="value">--</div>
-        </div>
-
-        <div class="summary">
-          <span>Firmware</span>
-          <div id="firmware" class="value">--</div>
-        </div>
-
-        <div class="summary">
-          <span>Paradas sem justificativa</span>
-          <div id="unclassifiedStops" class="value">--</div>
-        </div>
-
-        <div class="summary">
-          <span>Horímetro mestre</span>
-          <div id="masterSync" class="value">--</div>
-        </div>
-
-        <div class="summary">
-          <span>Sinal Wi-Fi</span>
-          <div id="wifiRssi" class="value">--</div>
-        </div>
-
-        <div class="summary">
-          <span>Eventos pendentes</span>
-          <div id="pending" class="value">--</div>
-        </div>
-
-        <div class="summary">
-          <span>Eventos perdidos</span>
-          <div id="lost" class="value">--</div>
-        </div>
-
-        <div class="summary">
-          <span>Reinicializações</span>
-          <div id="bootCount" class="value">--</div>
-        </div>
-
-        <div class="summary">
-          <span>Relógio</span>
-          <div id="clock" class="value">--</div>
-        </div>
-      </section>
-
-      <h2 class="section-title">
-        Equipamentos
-      </h2>
-
-      <section
-        id="equipmentGrid"
-        class="equipment-grid"
-      ></section>
-
-      <h2 class="section-title">
-        Últimos eventos operacionais
-      </h2>
-
-      <div class="small" style="margin:-6px 0 12px">
-        Eventos antigos de <strong>SISTEMA_INICIADO</strong> gerados pelos resets de teste
-        ficam fora desta lista para não esconder as partidas e paradas dos equipamentos.
-      </div>
-
-      <section class="card table-card">
-        <table>
-          <thead>
-            <tr>
-              <th>Horário</th>
-              <th>Equipamento</th>
-              <th>Evento</th>
-              <th>Duração</th>
-              <th>Motivo</th>
-              <th>Recebido</th>
-            </tr>
-          </thead>
-
-          <tbody id="eventsBody"></tbody>
-        </table>
-      </section>
-    </section>
-
-    <section
-      id="tab-management"
-      class="tab-page"
-    >
-      <div class="card">
         <div class="filters">
-          <div class="filter-group">
-            <label for="periodStart">Data inicial</label>
-            <input id="periodStart" type="date" />
-          </div>
-
-          <div class="filter-group">
-            <label for="periodEnd">Data final</label>
-            <input id="periodEnd" type="date" />
-          </div>
-
-          <div class="filter-group">
-            <label for="managementMotor">Equipamento</label>
-            <select id="managementMotor">
-              <option value="">Todos os equipamentos</option>
-            </select>
-          </div>
-
-          <button
-            id="loadManagement"
-            class="primary"
-          >
-            Aplicar período
-          </button>
-
-          <button id="exportCsv">
-            Exportar CSV
-          </button>
-        </div>
-
-        <div
-          id="managementMessage"
-          class="small"
-        >
-          Selecione o período para analisar.
+          <div class="filter"><label class="small">De</label><input id="periodStart" type="date"></div>
+          <div class="filter"><label class="small">Até</label><input id="periodEnd" type="date"></div>
+          <button id="applyPeriod" class="primary">Aplicar</button>
         </div>
       </div>
+      <div id="managementLoading" class="management-status">Carregando...</div>
+    </article>
 
+    <h2 class="section-title">Disponibilidade da Usina</h2>
+    <section class="kpi-grid">
+      <article class="card kpi"><span>Disponibilidade</span><strong id="kpiAvailability">N/D</strong></article>
+      <article class="card kpi"><span>Horas trabalhadas</span><strong id="kpiRunning">--</strong></article>
+      <article class="card kpi"><span>Indisponibilidade</span><strong id="kpiDowntime">--</strong></article>
+      <article class="card kpi"><span>Produção no período</span><strong id="kpiProduction">0 m³</strong></article>
+    </section>
+    <div class="small" style="margin-bottom:12px">Disponibilidade = horas trabalhadas ÷ jornada detectada/corrigida. <strong>Refeição é excluída do tempo programado</strong>; todos os demais motivos de parada reduzem a disponibilidade.</div>
 
-      <h2 class="section-title">
-        Jornada programada
-      </h2>
+    <h2 class="section-title">Linha do tempo</h2>
+    <div id="timelineDays"></div>
 
-      <section class="card schedule-card">
-        <div class="schedule-topline">
-          <div>
-            <div class="equipment-name">
-              Base da disponibilidade física
-            </div>
-
-            <div class="small">
-              Dias considerados: segunda a sábado.
-              Domingo não entra no tempo programado.
-            </div>
-          </div>
-
-          <div
-            id="scheduleConfiguredStatus"
-            class="schedule-status warning-text"
-          >
-            Aguardando configuração
-          </div>
-        </div>
-
-        <div class="schedule-grid">
-          <div class="filter-group">
-            <label for="workdayStart">
-              Início da jornada
-            </label>
-
-            <input
-              id="workdayStart"
-              type="time"
-              value="08:00"
-            />
-          </div>
-
-          <div class="filter-group">
-            <label for="workdayEnd">
-              Fim da jornada
-            </label>
-
-            <input
-              id="workdayEnd"
-              type="time"
-              value="17:30"
-            />
-          </div>
-
-          <div class="filter-group">
-            <label for="breakStart">
-              Início do intervalo
-            </label>
-
-            <input
-              id="breakStart"
-              type="time"
-            />
-          </div>
-
-          <div class="filter-group">
-            <label for="breakEnd">
-              Fim do intervalo
-            </label>
-
-            <input
-              id="breakEnd"
-              type="time"
-            />
-          </div>
-
-          <div class="filter-group">
-            <label for="scheduledHours">
-              Horas programadas / dia
-            </label>
-
-            <input
-              id="scheduledHours"
-              type="number"
-              min="0.25"
-              max="24"
-              step="0.25"
-              value="8"
-            />
-          </div>
-
-          <div class="schedule-save">
-            <button
-              id="saveSchedule"
-              class="primary"
-            >
-              Salvar jornada
-            </button>
-          </div>
-        </div>
-
-        <div
-          id="scheduleHoursPreview"
-          class="small"
-          style="margin-top:10px"
-        >
-          Defina o período do intervalo.
-        </div>
-
-        <div
-          id="scheduleSaveStatus"
-          class="command-status"
-          style="margin-top:7px"
-        ></div>
-
-        <div class="small" style="margin-top:10px">
-          Por segurança, o sistema só aceita a configuração se
-          <strong>jornada total − intervalo = horas programadas/dia</strong>.
-          Assim o cálculo de disponibilidade não fica inconsistente.
-        </div>
-      </section>
-
-      <h2 class="section-title">
-        Indicadores
-      </h2>
-
-      <section class="kpi-grid">
-        <div class="kpi">
-          <span id="kpi1Title">Disponibilidade física</span>
-          <strong id="kpi1Value">N/D</strong>
-        </div>
-
-        <div class="kpi">
-          <span id="kpi2Title">MTBF</span>
-          <strong id="kpi2Value">N/D</strong>
-        </div>
-
-        <div class="kpi">
-          <span id="kpi3Title">MTTR</span>
-          <strong id="kpi3Value">N/D</strong>
-        </div>
-
-        <div class="kpi">
-          <span id="kpi4Title">Falhas</span>
-          <strong id="kpi4Value">N/D</strong>
-        </div>
-      </section>
-
-      <div
-        id="availabilityNotice"
-        class="notice"
-      >
-        A disponibilidade física oficial permanece bloqueada até definirmos o critério.
+    <article id="stopEditor" class="card editor hidden">
+      <h3 id="stopEditorTitle">Editar parada</h3>
+      <div class="editor-grid">
+        <div class="filter"><label class="small">Início</label><input id="stopStart" type="datetime-local"></div>
+        <div class="filter"><label class="small">Fim</label><input id="stopEnd" type="datetime-local"></div>
+        <div class="filter"><label class="small">Motivo</label><select id="stopReason"></select></div>
+        <div class="filter"><label class="small">Observação</label><input id="stopNote" type="text" placeholder="Opcional"></div>
       </div>
+      <div class="editor-actions"><button id="saveStop" class="primary">Salvar correção</button><button id="cancelStop">Cancelar</button></div>
+    </article>
 
-      <div class="chart-legend">
-        <span style="--c:#2f80ed">Operacional</span>
-        <span style="--c:#a855f7">Manutenção programada</span>
-        <span style="--c:#ef5b5b">Técnica</span>
-        <span style="--c:#8fa1bd">Outro</span>
-        <span style="--c:#f6bd41">Não classificada</span>
+    <article id="dayEditor" class="card editor hidden">
+      <h3>Corrigir jornada do dia</h3>
+      <input id="dayEditDate" type="hidden">
+      <div class="editor-grid">
+        <div class="filter"><label class="small">Início da jornada</label><input id="dayStart" type="time"></div>
+        <div class="filter"><label class="small">Fim da jornada</label><input id="dayEnd" type="time"></div>
       </div>
+      <div class="editor-actions"><button id="saveDay" class="primary">Salvar jornada</button><button id="cancelDay">Cancelar</button></div>
+    </article>
 
-      <section class="chart-grid">
-        <article class="card">
-          <div class="equipment-name">
-            Intervenções por motivo
-          </div>
+    <h2 class="section-title">Pareto das causas de parada</h2>
+    <section class="pareto-grid">
+      <article class="card chart-card"><div class="chart-wrap"><canvas id="paretoChart"></canvas></div><div id="paretoEmpty" class="empty">Sem paradas no período.</div></article>
+      <article class="card legend-note"><strong>Regra gerencial</strong><p class="muted">Refeição não entra na indisponibilidade nem no Pareto. Paradas não classificadas entram como perda até serem revisadas.</p><p class="muted">Clique em qualquer trecho de parada na linha do tempo para corrigir o motivo e os horários. A alteração fica auditada e os eventos originais da HF-006 não são apagados.</p></article>
+    </section>
+  </section>
 
-          <div class="small">
-            Quantidade de paradas iniciadas no período selecionado
-          </div>
+  <section id="tab-components" class="tab-page">
+    <h2 class="section-title">Disponibilidade individual dos componentes</h2>
+    <div class="small" style="margin-bottom:12px">Usa o mesmo período selecionado na aba Gestão e exclui apenas a Refeição da jornada.</div>
+    <section id="componentsGrid" class="components-grid"></section>
+  </section>
 
-          <div class="chart-box">
-            <canvas id="chartReasonCount"></canvas>
-          </div>
-        </article>
-
-        <article class="card">
-          <div class="equipment-name">
-            Horas de parada por motivo
-          </div>
-
-          <div class="small">
-            Tempo de parada que intercepta o período selecionado
-          </div>
-
-          <div class="chart-box">
-            <canvas id="chartReasonTime"></canvas>
-          </div>
-        </article>
-      </section>
-
-      <h2 class="section-title">
-        Indicadores por equipamento
-      </h2>
-
-      <section class="card table-card">
-        <table>
-          <thead>
-            <tr>
-              <th>Equipamento</th>
-              <th>Horas operadas</th>
-              <th>Falhas</th>
-              <th>Indisp. física</th>
-              <th>DF</th>
-              <th>MTBF</th>
-              <th>MTTR</th>
-              <th>Falhas fechadas</th>
-            </tr>
-          </thead>
-
-          <tbody id="metricsBody">
-            <tr>
-              <td colspan="8" class="empty">
-                Sem dados oficiais no período.
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </section>
-
-      <h2 class="section-title">
-        Episódios de parada
-      </h2>
-
-      <section class="card table-card">
-        <table>
-          <thead>
-            <tr>
-              <th>Início</th>
-              <th>Equipamento</th>
-              <th>Fim</th>
-              <th>Duração</th>
-              <th>Motivo</th>
-              <th>Detalhe</th>
-              <th>O.S.</th>
-              <th>Falha?</th>
-              <th>Status</th>
-            </tr>
-          </thead>
-
-          <tbody id="episodesBody">
-            <tr>
-              <td colspan="9" class="empty">
-                Nenhuma parada oficial de produção.
-              </td>
-            </tr>
-          </tbody>
-        </table>
-      </section>
+  <section id="tab-production" class="tab-page">
+    <section class="kpi-grid production-summary">
+      <article class="card kpi"><span>Produção</span><strong id="prodTotal">0 m³</strong></article>
+      <article class="card kpi"><span>Caminhões</span><strong id="prodTrucks">0</strong></article>
+      <article class="card kpi"><span>Cargas / viagens</span><strong id="prodLoads">0</strong></article>
+      <article class="card kpi"><span>Produtividade</span><strong id="prodRate">N/D</strong></article>
     </section>
 
-    <section
-      id="tab-system"
-      class="tab-page"
-    >
-      <section class="summary-grid">
-        <div class="summary">
-          <span>Hardware UID</span>
-          <div id="hardwareUid" class="value">--</div>
+    <section class="production-layout">
+      <article id="productionForm" class="card">
+        <h3 id="productionFormTitle">Adicionar produção</h3>
+        <div class="production-form-grid">
+          <div class="filter"><label class="small">Data</label><input id="productionDate" type="date"></div>
+          <div class="filter"><label class="small">Traço / tipo de concreto</label><input id="mixName" list="mixOptions" placeholder="Pavimento Rígido"><datalist id="mixOptions"></datalist></div>
+          <div class="filter"><label class="small">Produção (m³)</label><input id="volumeM3" type="number" min="0" step="0.001"></div>
+          <div class="filter"><label class="small">Quantidade de caminhões</label><input id="trucksCount" type="number" min="0" step="1"></div>
+          <div class="filter"><label class="small">Cargas / viagens</label><input id="loadsCount" type="number" min="0" step="1"></div>
         </div>
+        <div class="filter" style="margin-top:10px"><label class="small">Observação</label><textarea id="productionNote" placeholder="Opcional"></textarea></div>
+        <div class="editor-actions"><button id="saveProduction" class="primary">Salvar produção</button><button id="cancelProductionEdit" class="hidden">Cancelar edição</button></div>
+        <div class="small" style="margin-top:10px">As horas rodadas são associadas automaticamente ao Horímetro Oficial da Usina no dia. Pavimento Rígido é o traço principal, mas novos traços podem ser digitados e ficam disponíveis para os próximos lançamentos.</div>
+      </article>
 
-        <div class="summary">
-          <span>Protocolo cloud</span>
-          <div id="protocolVersion" class="value">--</div>
-        </div>
-
-        <div class="summary">
-          <span>Firmware</span>
-          <div class="value" id="firmwareSystem">Veja no cabeçalho de operação</div>
-        </div>
-      </section>
-
-      <div class="notice">
-        O painel é público para leitura. O PIN é exigido somente para enviar justificativas e não fica gravado no código desta página.
-      </div>
+      <article class="card chart-card"><h3>Produção por dia</h3><div class="chart-wrap"><canvas id="productionChart"></canvas></div></article>
     </section>
 
-    <div
-      class="footer"
-      id="pageUpdated"
-    >
-      Carregando dados...
-    </div>
-  </main>
+    <h2 class="section-title">Lançamentos</h2>
+    <section class="card table-card">
+      <table><thead><tr><th>Data</th><th>Traço</th><th>Produção</th><th>Caminhões</th><th>Cargas</th><th>Horas rodadas</th><th>Ações</th></tr></thead><tbody id="productionBody"></tbody></table>
+    </section>
+  </section>
+
+  <footer class="footer">UC 0012 · dados operacionais preservados na HF-006/Supabase · correções gerenciais auditáveis</footer>
+</main>
 </body>
 </html>
