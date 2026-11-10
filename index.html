@@ -230,7 +230,7 @@
           '<span>'+localTime(d.detected_start_at)+' → '+localTime(d.detected_end_at)+'</span></div>'+
           '<div class="day-kpis"><b>'+fmtPct(d.availability_percent)+'</b><span>'+fmtShort(d.running_seconds)+' rodando</span></div></div>'+
           '<div class="timeline-track">'+segs+'</div>'+
-          '<div class="timeline-foot"><span>Programado: '+fmtShort(d.scheduled_seconds)+'</span><span>Parado: '+fmtShort(d.downtime_seconds)+'</span><span>Refeição: '+fmtShort(d.meal_seconds)+'</span>'+
+          '<div class="timeline-foot"><span>Programado: '+fmtShort(d.scheduled_seconds)+'</span><span>Parado: '+fmtShort(d.downtime_seconds)+'</span><span>Excluído da disponibilidade: '+fmtShort(d.excluded_availability_seconds||d.meal_seconds)+'</span>'+
           '<button class="link-btn edit-day" data-day="'+esc(d.date)+'">Editar jornada</button></div></article>';
       }).join("");
 
@@ -321,7 +321,7 @@
     function fillReasonOptions(rows){
       const select=$("stopReason");
       const current=select.value;
-      select.innerHTML=rows.map(function(r){return '<option value="'+esc(r.reason_code)+'">'+esc(r.label)+(r.is_meal?" · não afeta disponibilidade":"")+'</option>';}).join("");
+      select.innerHTML=rows.map(function(r){return '<option value="'+esc(r.reason_code)+'">'+esc(r.label)+(r.affects_availability===false?" · não afeta disponibilidade":"")+'</option>';}).join("");
       if(current && rows.some(function(r){return r.reason_code===current;})) select.value=current;
     }
 
@@ -541,7 +541,7 @@
       <article class="card kpi"><span>Indisponibilidade</span><strong id="kpiDowntime">--</strong></article>
       <article class="card kpi"><span>Produção no período</span><strong id="kpiProduction">0 m³</strong></article>
     </section>
-    <div class="small" style="margin-bottom:12px">Disponibilidade = horas trabalhadas ÷ jornada detectada/corrigida. <strong>Refeição é excluída do tempo programado</strong>; todos os demais motivos de parada reduzem a disponibilidade.</div>
+    <div class="small" style="margin-bottom:12px">Disponibilidade = horas trabalhadas ÷ jornada detectada/corrigida. <strong>Refeição e Sem operação são excluídos do tempo programado</strong>; os demais motivos de parada reduzem a disponibilidade.</div>
 
     <h2 class="section-title">Linha do tempo</h2>
     <div class="small" style="margin:-4px 0 12px">Hoje mostra 1 dia. Semana mostra os 7 dias completos, de segunda a domingo. Mês mostra todos os dias do mês selecionado. Dias sem atividade e dias futuros aparecem apenas como referência e não entram na disponibilidade.</div>
@@ -571,7 +571,7 @@
     <h2 class="section-title">Pareto das causas de parada</h2>
     <section class="pareto-grid">
       <article class="card chart-card"><div class="chart-wrap"><canvas id="paretoChart"></canvas></div><div id="paretoEmpty" class="empty">Sem paradas no período.</div></article>
-      <article class="card legend-note"><strong>Regra gerencial</strong><p class="muted">Refeição não entra na indisponibilidade nem no Pareto. Paradas não classificadas entram como perda até serem revisadas.</p><p class="muted">Clique em qualquer trecho de parada na linha do tempo para corrigir o motivo e os horários. A alteração fica auditada e os eventos originais da HF-006 não são apagados.</p></article>
+      <article class="card legend-note"><strong>Regra gerencial</strong><p class="muted">Refeição e Sem operação não entram na indisponibilidade nem no Pareto. Paradas não classificadas entram como perda até serem revisadas.</p><p class="muted">Clique em qualquer trecho de parada na linha do tempo para corrigir o motivo e os horários. A alteração fica auditada e os eventos originais da HF-006 não são apagados.</p></article>
     </section>
   </section>
 
