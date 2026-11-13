@@ -21,12 +21,22 @@
     const chartMuted = function(){ return isLight() ? "#64748b" : "#9fb0c8"; };
     const chartGrid = function(){ return isLight() ? "#e2e8f0" : "#24324a"; };
 
-    let latestOverview = null;
+    // Cada aba de dados tem período e status próprios.
+    // Só Gestão e Produção pedem PIN, e cada uma tem o seu.
+    const SCOPES = {
+      gestao:      { start:"gestaoStart", end:"gestaoEnd", status:"managementLoading", pin:"gestaoPin" },
+      componentes: { start:"compStart",   end:"compEnd",   status:"compLoading" },
+      producao:    { start:"prodStart",   end:"prodEnd",   status:"prodLoading",     pin:"producaoPin" }
+    };
+
+    const TAB_SCOPE = { management:"gestao", components:"componentes", production:"producao" };
+    const currentScope = function(){ return TAB_SCOPE[activeTab] || "gestao"; };
+    const overviews = { gestao:null, componentes:null, producao:null };
+    let activeTab = "operation";
     let selectedStop = null;
     let productionEditId = null;
     let paretoChart = null;
     let productionChart = null;
-    let periodMode = "today";
 
     function esc(v){
       return String(v == null ? "" : v)
@@ -70,11 +80,13 @@
       el.textContent=msg||"";
       el.className="save-status "+(kind||"");
     }
-    function pin(){ return $("operatorPin").value.trim(); }
+    function requirePin(pinId){
+      if(!$(pinId).value.trim()) throw new Error("Informe o PIN antes de salvar.");
+    }
 
-    async function mgmt(body,needPin){
+    async function mgmt(body,pinId){
       const headers={"Content-Type":"application/json"};
-      if(needPin) headers["X-Operator-Pin"]=pin();
+      if(pinId) headers["X-Operator-Pin"]=$(pinId).value.trim();
       const res=await fetch(MANAGEMENT_URL,{method:"POST",headers:headers,body:JSON.stringify(body)});
       const data=await res.json().catch(function(){return {};});
       if(!res.ok) throw new Error(data.error||("HTTP "+res.status));
@@ -101,14 +113,19 @@
       return d.toISOString().slice(0,10);
     }
 
-    function applyQuickPeriod(mode){
-      periodMode=mode;
-      document.querySelectorAll(".period-btn").forEach(function(b){b.classList.toggle("active",b.dataset.mode===mode);});
+    function setPillsActive(scope,mode){
+      document.querySelectorAll('.period-btn[data-scope="'+scope+'"]').forEach(function(b){
+        b.classList.toggle("active", b.dataset.mode===mode);
+      });
+    }
+    function applyQuickPeriod(scope,mode){
       const today=localDate();
-      if(mode==="today"){ $("periodStart").value=today; $("periodEnd").value=today; }
-      if(mode==="week"){ $("periodStart").value=mondayOf(today); $("periodEnd").value=sundayOf(today); }
-      if(mode==="month"){ $("periodStart").value=monthStart(today); $("periodEnd").value=monthEnd(today); }
-      loadOverview();
+      const s=$(SCOPES[scope].start), e=$(SCOPES[scope].end);
+      if(mode==="today"){ s.value=today; e.value=today; }
+      if(mode==="week"){ s.value=mondayOf(today); e.value=sundayOf(today); }
+      if(mode==="month"){ s.value=monthStart(today); e.value=monthEnd(today); }
+      setPillsActive(scope,mode);
+      loadOverview(scope);
     }
 
     async function loadLive(){
@@ -173,31 +190,42 @@
       }).join(""):'<tr><td colspan="4" class="empty">Sem eventos.</td></tr>';
     }
 
-    async function loadOverview(){
-      const start=$("periodStart").value, end=$("periodEnd").value;
+    async function loadOverview(scope){
+      const cfg=SCOPES[scope];
+      const start=$(cfg.start).value, end=$(cfg.end).value;
       if(!start||!end) return;
-      $("managementLoading").textContent="Atualizando indicadores...";
+      const status=$(cfg.status);
+      status.textContent="Atualizando indicadores...";
       try{
-        latestOverview=await mgmt({kind:"overview",start:start,end:end},false);
-        renderOverview(latestOverview);
-        $("managementLoading").textContent="Atualizado agora.";
+        const data=await mgmt({kind:"overview",start:start,end:end},null);
+        overviews[scope]=data;
+        renderOfficial(data);
+        if(scope==="gestao") renderGestao(data);
+        if(scope==="componentes") renderComponents(data.components||[]);
+        if(scope==="producao") renderProducao(data);
+        status.textContent="Atualizado agora.";
       }catch(e){
-        $("managementLoading").textContent="Erro: "+e.message;
+        status.textContent="Erro: "+e.message;
       }
     }
 
-    function renderOverview(data){
+    function renderOfficial(data){
       $("officialHourmeter").textContent=fmtSec(data.official_hourmeter_seconds);
       $("officialStarted").textContent=data.official_started_at?"Desde "+localDateTime(data.official_started_at):"";
+    }
+
+    function renderGestao(data){
       $("kpiAvailability").textContent=fmtPct(data.period.availability_percent);
       $("kpiRunning").textContent=fmtShort(data.period.running_seconds);
       $("kpiDowntime").textContent=fmtShort(data.period.downtime_seconds);
       $("kpiProduction").textContent=fmtM3(data.production_summary.total_m3);
       renderTimeline(data.days||[]);
       renderPareto(data.pareto||[]);
-      renderComponents(data.components||[]);
-      renderProduction(data);
       fillReasonOptions(data.reasons||[]);
+    }
+
+    function renderProducao(data){
+      renderProduction(data);
       fillMixOptions(data.mix_catalog||[]);
     }
 
@@ -248,8 +276,9 @@
     }
 
     function openStopEditor(day,key){
-      if(!latestOverview) return;
-      const d=(latestOverview.days||[]).find(function(x){return x.date===day;});
+      const ovw=overviews.gestao;
+      if(!ovw) return;
+      const d=(ovw.days||[]).find(function(x){return x.date===day;});
       const seg=d && (d.timeline||[]).find(function(x){return x.segment_key===key;});
       if(!seg) return;
       selectedStop={day:day,seg:seg};
@@ -263,8 +292,9 @@
     }
 
     function openDayEditor(day){
-      if(!latestOverview) return;
-      const d=(latestOverview.days||[]).find(function(x){return x.date===day;});
+      const ovw=overviews.gestao;
+      if(!ovw) return;
+      const d=(ovw.days||[]).find(function(x){return x.date===day;});
       if(!d) return;
       $("dayEditor").classList.remove("hidden");
       $("dayEditDate").value=day;
@@ -287,6 +317,7 @@
     async function saveStop(){
       if(!selectedStop) return;
       try{
+        requirePin("gestaoPin");
         setStatus("Salvando parada...","pending");
         const seg=selectedStop.seg;
         await mgmt({
@@ -299,11 +330,11 @@
           adjusted_end_at:dtLocalToIso($("stopEnd").value),
           reason_code:$("stopReason").value,
           note:$("stopNote").value
-        },true);
+        },"gestaoPin");
         setStatus("Parada atualizada e auditada.","oktxt");
         $("stopEditor").classList.add("hidden");
         selectedStop=null;
-        await loadOverview();
+        await loadOverview("gestao");
       }catch(e){ setStatus(e.message,"badtext"); }
     }
 
@@ -311,15 +342,16 @@
       const day=$("dayEditDate").value;
       if(!day) return;
       try{
+        requirePin("gestaoPin");
         setStatus("Salvando jornada...","pending");
         await mgmt({
           kind:"save_day",operation_date:day,
           start_at:new Date(day+"T"+$("dayStart").value+":00-03:00").toISOString(),
           end_at:new Date(day+"T"+$("dayEnd").value+":00-03:00").toISOString()
-        },true);
+        },"gestaoPin");
         setStatus("Jornada corrigida e auditada.","oktxt");
         $("dayEditor").classList.add("hidden");
-        await loadOverview();
+        await loadOverview("gestao");
       }catch(e){ setStatus(e.message,"badtext"); }
     }
 
@@ -391,7 +423,9 @@
     }
 
     function editProduction(id){
-      const p=(latestOverview.production||[]).find(function(x){return Number(x.id)===id;});
+      const ovw=overviews.producao;
+      if(!ovw) return;
+      const p=(ovw.production||[]).find(function(x){return Number(x.id)===id;});
       if(!p) return;
       productionEditId=id;
       $("productionDate").value=p.operation_date;
@@ -414,12 +448,14 @@
       $("loadsCount").value="";
       $("productionNote").value="";
       $("cancelProductionEdit").classList.add("hidden");
-      const primary=(latestOverview?.mix_catalog||[]).find(function(m){return m.is_primary;});
+      const ovw=overviews.producao;
+      const primary=((ovw&&ovw.mix_catalog)||[]).find(function(m){return m.is_primary;});
       $("mixName").value=primary?primary.mix_name:"Pavimento Rígido";
     }
 
     async function saveProduction(){
       try{
+        requirePin("producaoPin");
         setStatus("Salvando produção...","pending");
         await mgmt({
           kind:"save_production",id:productionEditId,
@@ -429,42 +465,33 @@
           trucks_count:$("trucksCount").value===""?null:Number($("trucksCount").value),
           loads_count:$("loadsCount").value===""?null:Number($("loadsCount").value),
           note:$("productionNote").value
-        },true);
+        },"producaoPin");
         setStatus("Produção salva.","oktxt");
         clearProductionForm();
-        await loadOverview();
+        await loadOverview("producao");
       }catch(e){setStatus(e.message,"badtext");}
     }
 
     async function deleteProduction(id){
-      if(!confirm("Excluir este lançamento de produção?")) return;
       try{
-        await mgmt({kind:"delete_production",id:id},true);
+        requirePin("producaoPin");
+        if(!confirm("Excluir este lançamento de produção?")) return;
+        await mgmt({kind:"delete_production",id:id},"producaoPin");
         setStatus("Lançamento excluído.","oktxt");
-        await loadOverview();
+        await loadOverview("producao");
       }catch(e){setStatus(e.message,"badtext");}
     }
 
     function switchTab(name){
+      activeTab=name;
       document.querySelectorAll(".tab-btn").forEach(function(b){b.classList.toggle("active",b.dataset.tab===name);});
       document.querySelectorAll(".tab-page").forEach(function(p){p.classList.toggle("active",p.id==="tab-"+name);});
-      if(name!=="operation") loadOverview();
+      if(name!=="operation") loadOverview(TAB_SCOPE[name]);
     }
-
-    document.querySelectorAll(".tab-btn").forEach(function(b){b.addEventListener("click",function(){switchTab(b.dataset.tab);});});
-    document.querySelectorAll(".period-btn").forEach(function(b){b.addEventListener("click",function(){applyQuickPeriod(b.dataset.mode);});});
-    $("applyPeriod").addEventListener("click",function(){periodMode="custom";loadOverview();});
-    $("refreshBtn").addEventListener("click",async function(){await Promise.all([loadLive(),loadOverview()]);});
-    $("saveStop").addEventListener("click",saveStop);
-    $("cancelStop").addEventListener("click",function(){$("stopEditor").classList.add("hidden");selectedStop=null;});
-    $("saveDay").addEventListener("click",saveDay);
-    $("cancelDay").addEventListener("click",function(){$("dayEditor").classList.add("hidden");});
-    $("saveProduction").addEventListener("click",saveProduction);
-    $("cancelProductionEdit").addEventListener("click",clearProductionForm);
 
     function updateThemeBtn(){
       const b=$("themeBtn");
-      b.textContent=isLight()?"\u2600":"\u263E";
+      b.textContent=isLight()?"☀":"☾";
       b.title=isLight()?"Usar modo escuro":"Usar modo claro";
       b.setAttribute("aria-label",b.title);
     }
@@ -473,15 +500,38 @@
       document.documentElement.dataset.theme=next;
       try{localStorage.setItem("uc0012-theme",next);}catch(e){}
       updateThemeBtn();
-      if(latestOverview){ renderPareto(latestOverview.pareto||[]); renderProduction(latestOverview); }
+      if(overviews.gestao) renderPareto(overviews.gestao.pareto||[]);
+      if(overviews.producao) renderProduction(overviews.producao);
     });
-    updateThemeBtn();
 
+    document.querySelectorAll(".tab-btn").forEach(function(b){b.addEventListener("click",function(){switchTab(b.dataset.tab);});});
+    document.querySelectorAll(".period-btn").forEach(function(b){b.addEventListener("click",function(){applyQuickPeriod(b.dataset.scope,b.dataset.mode);});});
+    $("applyGestao").addEventListener("click",function(){setPillsActive("gestao","custom");loadOverview("gestao");});
+    $("applyComp").addEventListener("click",function(){setPillsActive("componentes","custom");loadOverview("componentes");});
+    $("applyProd").addEventListener("click",function(){setPillsActive("producao","custom");loadOverview("producao");});
+    $("refreshBtn").addEventListener("click",async function(){
+      await loadLive();
+      await loadOverview(currentScope());
+    });
+    $("saveStop").addEventListener("click",saveStop);
+    $("cancelStop").addEventListener("click",function(){$("stopEditor").classList.add("hidden");selectedStop=null;});
+    $("saveDay").addEventListener("click",saveDay);
+    $("cancelDay").addEventListener("click",function(){$("dayEditor").classList.add("hidden");});
+    $("saveProduction").addEventListener("click",saveProduction);
+    $("cancelProductionEdit").addEventListener("click",clearProductionForm);
+
+    updateThemeBtn();
     const today=localDate();
-    $("periodStart").value=today; $("periodEnd").value=today; $("productionDate").value=today;
-    await Promise.all([loadLive(),loadOverview()]);
+    Object.keys(SCOPES).forEach(function(scope){
+      $(SCOPES[scope].start).value=today;
+      $(SCOPES[scope].end).value=today;
+    });
+    $("productionDate").value=today;
+    await Promise.all([loadLive(),loadOverview("gestao")]);
     setInterval(loadLive,5000);
-    setInterval(function(){if(document.visibilityState==="visible") loadOverview();},30000);
+    setInterval(function(){
+      if(document.visibilityState==="visible") loadOverview(currentScope());
+    },30000);
   </script>
   <style>
     :root{
@@ -562,9 +612,6 @@
     .brand h1{margin:0 0 2px;font-size:19px;font-weight:800}
     .brand .muted{font-size:12px}
     .top-actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
-    .pin-box{display:flex;align-items:center;gap:8px}
-    .pin-box label{white-space:nowrap}
-    .pin-box input{width:120px}
     .icon-btn{width:38px;height:38px;padding:0;display:inline-flex;align-items:center;justify-content:center;font-size:17px;line-height:1}
     .status-stack{text-align:right}
 
@@ -580,8 +627,8 @@
     input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
     input::placeholder,textarea::placeholder{color:var(--muted)}
     textarea{min-height:76px;resize:vertical}
-    .pin-box input,.filter input{width:auto}
-    .pin-box input{width:120px}
+    .filter input{width:auto}
+    .filter input.pin-input{width:150px}
 
     /* Abas */
     .tabs{display:flex;gap:4px;overflow:auto;border-bottom:1px solid var(--border);margin:0 0 20px;scrollbar-width:none}
@@ -693,7 +740,6 @@
       .topbar{margin:-14px -12px 14px;padding:12px}
       .brand h1{font-size:17px}
       .top-actions{width:100%;justify-content:space-between}
-      .pin-box input{width:100px}
       .status-stack{text-align:left}
       .mini-grid{grid-template-columns:1fr}
       .official strong{font-size:28px}
@@ -708,7 +754,6 @@
   <header class="topbar">
     <div class="brand"><h1>UC 0012 — Operação e Gestão</h1><div class="muted">HF-006 · monitoramento operacional da usina de concreto</div></div>
     <div class="top-actions">
-      <div class="pin-box"><label class="small" for="operatorPin">PIN para alterações</label><input id="operatorPin" type="password" autocomplete="off" placeholder="PIN"></div>
       <div class="status-stack"><div id="cloudStatus" class="pill bad">● HF-006 OFFLINE</div><div id="lastSeen" class="small" style="margin-top:5px">Sem atualização</div></div>
       <button id="themeBtn" class="icon-btn" type="button" title="Usar modo claro" aria-label="Usar modo claro">☾</button>
       <button id="refreshBtn">Atualizar</button>
@@ -747,15 +792,16 @@
       <div class="management-top">
         <div>
           <div class="period-pills">
-            <button class="period-btn active" data-mode="today">Hoje</button>
-            <button class="period-btn" data-mode="week">Semana</button>
-            <button class="period-btn" data-mode="month">Mês</button>
+            <button class="period-btn active" data-scope="gestao" data-mode="today">Hoje</button>
+            <button class="period-btn" data-scope="gestao" data-mode="week">Semana</button>
+            <button class="period-btn" data-scope="gestao" data-mode="month">Mês</button>
           </div>
         </div>
         <div class="filters">
-          <div class="filter"><label class="small">De</label><input id="periodStart" type="date"></div>
-          <div class="filter"><label class="small">Até</label><input id="periodEnd" type="date"></div>
-          <button id="applyPeriod" class="primary">Aplicar</button>
+          <div class="filter"><label class="small" for="gestaoPin">PIN da gestão</label><input id="gestaoPin" class="pin-input" type="password" autocomplete="off" placeholder="PIN"></div>
+          <div class="filter"><label class="small" for="gestaoStart">De</label><input id="gestaoStart" type="date"></div>
+          <div class="filter"><label class="small" for="gestaoEnd">Até</label><input id="gestaoEnd" type="date"></div>
+          <button id="applyGestao" class="primary">Aplicar</button>
         </div>
       </div>
       <div id="managementLoading" class="management-status">Carregando...</div>
@@ -803,12 +849,46 @@
   </section>
 
   <section id="tab-components" class="tab-page">
+    <article class="card">
+      <div class="management-top">
+        <div>
+          <div class="period-pills">
+            <button class="period-btn active" data-scope="componentes" data-mode="today">Hoje</button>
+            <button class="period-btn" data-scope="componentes" data-mode="week">Semana</button>
+            <button class="period-btn" data-scope="componentes" data-mode="month">Mês</button>
+          </div>
+        </div>
+        <div class="filters">
+          <div class="filter"><label class="small" for="compStart">De</label><input id="compStart" type="date"></div>
+          <div class="filter"><label class="small" for="compEnd">Até</label><input id="compEnd" type="date"></div>
+          <button id="applyComp" class="primary">Aplicar</button>
+        </div>
+      </div>
+      <div id="compLoading" class="management-status">Carregando...</div>
+    </article>
     <h2 class="section-title">Disponibilidade individual dos componentes</h2>
-    <div class="small" style="margin-bottom:12px">Usa o mesmo período selecionado na aba Gestão e exclui apenas a Refeição da jornada.</div>
+    <div class="small" style="margin-bottom:12px">Usa o período selecionado nesta aba e exclui apenas a Refeição da jornada.</div>
     <section id="componentsGrid" class="components-grid"></section>
   </section>
 
   <section id="tab-production" class="tab-page">
+    <article class="card">
+      <div class="management-top">
+        <div>
+          <div class="period-pills">
+            <button class="period-btn active" data-scope="producao" data-mode="today">Hoje</button>
+            <button class="period-btn" data-scope="producao" data-mode="week">Semana</button>
+            <button class="period-btn" data-scope="producao" data-mode="month">Mês</button>
+          </div>
+        </div>
+        <div class="filters">
+          <div class="filter"><label class="small" for="prodStart">De</label><input id="prodStart" type="date"></div>
+          <div class="filter"><label class="small" for="prodEnd">Até</label><input id="prodEnd" type="date"></div>
+          <button id="applyProd" class="primary">Aplicar</button>
+        </div>
+      </div>
+      <div id="prodLoading" class="management-status">Carregando...</div>
+    </article>
     <section class="kpi-grid production-summary">
       <article class="card kpi"><span>Produção</span><strong id="prodTotal">0 m³</strong></article>
       <article class="card kpi"><span>Caminhões</span><strong id="prodTrucks">0</strong></article>
@@ -819,6 +899,7 @@
     <section class="production-layout">
       <article id="productionForm" class="card">
         <h3 id="productionFormTitle">Adicionar produção</h3>
+        <div class="filter" style="margin-bottom:12px"><label class="small" for="producaoPin">PIN da produção</label><input id="producaoPin" class="pin-input" type="password" autocomplete="off" placeholder="PIN"></div>
         <div class="production-form-grid">
           <div class="filter"><label class="small">Data</label><input id="productionDate" type="date"></div>
           <div class="filter"><label class="small">Traço / tipo de concreto</label><input id="mixName" list="mixOptions" placeholder="Pavimento Rígido"><datalist id="mixOptions"></datalist></div>
