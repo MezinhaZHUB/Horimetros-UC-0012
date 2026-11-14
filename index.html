@@ -5,7 +5,6 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <script>(function(){try{var t=localStorage.getItem("uc0012-theme");if(t==="light"||t==="dark")document.documentElement.dataset.theme=t;}catch(e){}})();</script>
   <title>UC 0012 | Operação e Gestão</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
   <script type="module">
     import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm";
 
@@ -17,26 +16,28 @@
     const TZ = "America/Sao_Paulo";
     const $ = function(id){ return document.getElementById(id); };
     const isLight = function(){ return document.documentElement.dataset.theme === "light"; };
-    const chartText = function(){ return isLight() ? "#1e293b" : "#d9e2ef"; };
-    const chartMuted = function(){ return isLight() ? "#64748b" : "#9fb0c8"; };
-    const chartGrid = function(){ return isLight() ? "#e2e8f0" : "#24324a"; };
 
     // Cada aba de dados tem período e status próprios.
-    // Só Gestão e Produção pedem PIN, e cada uma tem o seu.
+    // Gestão, Produção e Metas pedem PIN (Metas usa o mesmo PIN da Gestão).
     const SCOPES = {
       gestao:      { start:"gestaoStart", end:"gestaoEnd", status:"managementLoading", pin:"gestaoPin" },
       componentes: { start:"compStart",   end:"compEnd",   status:"compLoading" },
-      producao:    { start:"prodStart",   end:"prodEnd",   status:"prodLoading",     pin:"producaoPin" }
+      producao:    { start:"prodStart",   end:"prodEnd",   status:"prodLoading",     pin:"producaoPin" },
+      metas:       { status:"metaLoading", pin:"metaPin" }
     };
 
-    const TAB_SCOPE = { management:"gestao", components:"componentes", production:"producao" };
+    const TAB_SCOPE = { management:"gestao", components:"componentes", production:"producao", targets:"metas" };
     const currentScope = function(){ return TAB_SCOPE[activeTab] || "gestao"; };
-    const overviews = { gestao:null, componentes:null, producao:null };
+    const overviews = { gestao:null, componentes:null, producao:null, metas:null };
+    const requestSeq = { gestao:0, componentes:0, producao:0, metas:0 };
+    const TIMELINE_MAX_DAYS = 62;
+    const CATEGORY_LABEL = { unavailability:"Indisponibilidade", efficiency:"Perda de eficiência", excluded:"Fora da jornada", unclassified:"Sem classificação" };
+    const MONTHS = ["jan","fev","mar","abr","mai","jun","jul","ago","set","out","nov","dez"];
     let activeTab = "operation";
     let selectedStop = null;
     let productionEditId = null;
-    let paretoChart = null;
-    let productionChart = null;
+    let prodView = "rate";
+    let tipEl = null;
 
     function esc(v){
       return String(v == null ? "" : v)
@@ -93,6 +94,33 @@
       return data;
     }
 
+    function fmtRate(value){
+      if(value===null || value===undefined || !Number.isFinite(Number(value))) return "N/D";
+      return Number(value).toLocaleString("pt-BR",{minimumFractionDigits:1,maximumFractionDigits:1});
+    }
+    function fmtNum(value,digits){
+      return Number(value||0).toLocaleString("pt-BR",{minimumFractionDigits:0,maximumFractionDigits:digits==null?1:digits});
+    }
+    function fmtPct0(value){
+      if(value===null || value===undefined || !Number.isFinite(Number(value))) return "";
+      return Math.round(Number(value))+"%";
+    }
+    function fmtPp(value){
+      const v=Math.round(Number(value)*10)/10;
+      const sign=v>0?"+":(v<0?"−":"");
+      return sign+Math.abs(v).toLocaleString("pt-BR",{minimumFractionDigits:1,maximumFractionDigits:1})+" p.p.";
+    }
+    function daysBetween(a,b){
+      return Math.round((Date.parse(b+"T12:00:00Z")-Date.parse(a+"T12:00:00Z"))/86400000)+1;
+    }
+    function fmtDay(d){ return d.slice(8,10)+"/"+d.slice(5,7); }
+    function fmtDayFull(d){ return d.split("-").reverse().join("/"); }
+    function fmtMonth(k){ return MONTHS[Number(k.slice(5,7))-1]+"/"+k.slice(2,4); }
+    function weekdayShort(d){
+      return new Date(d+"T12:00:00-03:00").toLocaleDateString("pt-BR",{weekday:"short",timeZone:TZ}).replace(".","");
+    }
+    function plural(n,one,many){ return n+" "+(n===1?one:many); }
+
     function mondayOf(dateStr){
       const d=new Date(dateStr+"T12:00:00-03:00");
       const day=d.getDay();
@@ -118,12 +146,14 @@
         b.classList.toggle("active", b.dataset.mode===mode);
       });
     }
+
     function applyQuickPeriod(scope,mode){
       const today=localDate();
       const s=$(SCOPES[scope].start), e=$(SCOPES[scope].end);
       if(mode==="today"){ s.value=today; e.value=today; }
       if(mode==="week"){ s.value=mondayOf(today); e.value=sundayOf(today); }
       if(mode==="month"){ s.value=monthStart(today); e.value=monthEnd(today); }
+      if(mode==="year"){ s.value=today.slice(0,4)+"-01-01"; e.value=today.slice(0,4)+"-12-31"; }
       setPillsActive(scope,mode);
       loadOverview(scope);
     }
@@ -192,20 +222,29 @@
 
     async function loadOverview(scope){
       const cfg=SCOPES[scope];
-      const start=$(cfg.start).value, end=$(cfg.end).value;
+      const start=cfg.start?$(cfg.start).value:localDate();
+      const end=cfg.end?$(cfg.end).value:start;
       if(!start||!end) return;
       const status=$(cfg.status);
+      if(start>end){ status.textContent="A data inicial é maior que a data final."; return; }
+      const seq=++requestSeq[scope];
+      // Só a Gestão precisa da linha do tempo de cada dia, e só em períodos curtos.
+      const compact=scope!=="gestao" || daysBetween(start,end)>TIMELINE_MAX_DAYS;
       status.textContent="Atualizando indicadores...";
       try{
-        const data=await mgmt({kind:"overview",start:start,end:end},null);
+        const data=await mgmt({kind:"overview",start:start,end:end,compact:compact},null);
+        if(seq!==requestSeq[scope]) return;
+        const open=openKeys();
         overviews[scope]=data;
         renderOfficial(data);
         if(scope==="gestao") renderGestao(data);
         if(scope==="componentes") renderComponents(data.components||[]);
         if(scope==="producao") renderProducao(data);
+        if(scope==="metas") renderTargets(data);
+        restoreOpen(open);
         status.textContent="Atualizado agora.";
       }catch(e){
-        status.textContent="Erro: "+e.message;
+        if(seq===requestSeq[scope]) status.textContent="Erro: "+e.message;
       }
     }
 
@@ -214,24 +253,166 @@
       $("officialStarted").textContent=data.official_started_at?"Desde "+localDateTime(data.official_started_at):"";
     }
 
+    // ---------- Gestão: disponibilidade mecânica x eficiência ----------
+    function targetChip(value,target){
+      if(value===null || value===undefined) return '<span class="target-chip none">Sem dados</span>';
+      if(target===null || target===undefined) return '<span class="target-chip none">Meta não definida</span>';
+      const diff=Math.round((value-target)*10)/10;
+      return diff>=0
+        ? '<span class="target-chip ok">✓ Meta atingida · '+fmtPp(diff)+'</span>'
+        : '<span class="target-chip bad">▼ Abaixo da meta · '+fmtPp(diff)+'</span>';
+    }
+
+    function meter(value,target){
+      const w=Math.max(0,Math.min(100,value));
+      const hasT=target!==null && target!==undefined;
+      let h='<div class="meter-wrap'+(hasT?' has-target':'')+'"><div class="meter" role="img" aria-label="'+esc(fmtPct(value)+(hasT?" (meta "+fmtPct(target)+")":""))+'">'+
+        '<span class="meter-fill" style="width:'+w+'%"></span>';
+      if(hasT) h+='<span class="meter-target" style="left:'+Math.max(0,Math.min(100,target))+'%"></span>';
+      h+='</div>';
+      if(hasT) h+='<span class="meter-target-label" style="left:'+Math.max(8,Math.min(92,target))+'%">Meta '+esc(fmtPct(target))+'</span>';
+      return h+'</div>';
+    }
+
+    function reasonList(rows){
+      if(!rows.length) return '<div class="empty-note">Nenhuma parada deste tipo no período.</div>';
+      const max=Math.max.apply(null,rows.map(function(r){return r.seconds;}))||1;
+      return '<div class="reason-list">'+rows.map(function(r){
+        return '<div class="reason-row'+(r.unclassified?' unclassified':'')+'"><span class="reason-name">'+(r.unclassified?'⚠ ':'')+esc(r.label)+'</span>'+
+          '<span class="reason-track"><span class="reason-bar" style="width:'+(r.seconds/max*100).toFixed(1)+'%"></span></span>'+
+          '<span class="reason-val"><b>'+fmtShort(r.seconds)+'</b> <small>· '+esc(fmtPct(r.pct_of_category))+'</small></span></div>';
+      }).join("")+'</div>';
+    }
+
+    function reasonTable(key,rows){
+      if(!rows.length) return "";
+      const total=rows.reduce(function(s,r){return s+r.seconds;},0);
+      const totalJ=rows.reduce(function(s,r){return s+(r.pct_of_journey||0);},0);
+      const body=rows.map(function(r){
+        return [(r.unclassified?"⚠ ":"")+r.label,fmtShort(r.seconds),String(r.count),fmtPct(r.pct_of_category),fmtPct(r.pct_of_journey)];
+      });
+      body.push(["Total",fmtShort(total),String(rows.reduce(function(s,r){return s+r.count;},0)),"100,0%",fmtPct(totalJ)]);
+      return tableTwin("tbl-"+key,"Ver como tabela",["Motivo","Horas","Paradas","% do total","% da jornada"],body,1);
+    }
+
+    function indicatorCard(o){
+      let h='<article class="card indicator '+o.cls+'"><div class="ind-head"><div><h3>'+esc(o.title)+'</h3><p class="muted">'+esc(o.desc)+'</p></div></div>';
+      const has=o.value!==null && o.value!==undefined && o.hasBase;
+      if(!has) return h+'<div class="empty-note" style="margin-top:14px">Sem jornada registrada no período, então este indicador não pode ser calculado.</div></article>';
+      h+='<div class="ind-figure"><strong>'+esc(fmtPct(o.value))+'</strong>'+targetChip(o.value,o.target)+'</div>'+meter(o.value,o.target);
+      h+='<div class="ind-sub muted">'+esc(o.lostLabel)+': <b>'+fmtShort(o.lostSeconds)+'</b> · '+esc(fmtPct(o.lostPct))+' '+esc(o.lostBase)+'</div>';
+      h+='<h4 class="ind-sub-title">'+esc(o.listTitle)+' · horas e % do total</h4>'+reasonList(o.rows)+reasonTable(o.key,o.rows);
+      return h+'</article>';
+    }
+
+    function renderUnclassNotice(k,tooLong){
+      const box=$("unclassNotice");
+      if(k && k.unclassified_seconds>0){
+        box.innerHTML='<span class="ico">⚠</span><div><b>'+fmtShort(k.unclassified_seconds)+' de paradas sem motivo classificado.</b> Enquanto não forem classificadas, contam como perda de eficiência e podem distorcer os números. '+
+          (tooLong?'Escolha Hoje, Semana ou Mês para localizar essas paradas na linha do tempo.':'Clique no trecho da parada na linha do tempo e escolha o motivo.')+'</div>';
+        box.classList.remove("hidden");
+      }else{
+        box.classList.add("hidden");
+        box.innerHTML="";
+      }
+    }
+
+    function renderExcluded(rows){
+      const box=$("excludedStrip");
+      if(!rows.length){ box.classList.add("hidden"); box.innerHTML=""; return; }
+      box.classList.remove("hidden");
+      box.innerHTML='<strong>Fora da jornada</strong>'+rows.map(function(r){
+        return '<span class="chip">'+esc(r.label)+' <b>'+fmtShort(r.seconds)+'</b></span>';
+      }).join("")+'<span class="small">Não entram na disponibilidade nem na eficiência.</span>';
+    }
+
+    function renderTrend(data){
+      const tr=data.trend||{}, buckets=tr.buckets||[], gran=tr.granularity||"day";
+      const sec=$("trendSection");
+      if(buckets.length<2){ sec.classList.add("hidden"); $("trendTable").innerHTML=""; return; }
+      sec.classList.remove("hidden");
+      const t=data.targets||{};
+      const unit=gran==="day"?"dia":(gran==="week"?"semana":"mês");
+      $("trendAvailTitle").textContent="Disponibilidade por "+unit;
+      $("trendEffTitle").textContent="Eficiência por "+unit;
+      const n=buckets.length;
+      const xLabel=function(b){ return gran==="month"?fmtMonth(b.key):((gran==="day"&&n>12)?b.key.slice(8,10):fmtDay(b.key)); };
+      const tipTitle=function(b){
+        if(gran==="day") return weekdayShort(b.key)+" "+fmtDayFull(b.key);
+        return (gran==="week"?"Semana de "+fmtDay(b.key):fmtMonth(b.key))+" · "+plural(b.days_count,"dia","dias")+" de operação";
+      };
+      const build=function(hostId,valueKey,color,target,tipRows){
+        const vals=buckets.map(function(b){return b[valueKey];});
+        const show=pickLabels(vals,12);
+        const hasT=target!==null && target!==undefined;
+        columnChart($(hostId),{
+          max:100,ticks:[0,25,50,75,100],fmtTick:function(v){return v+"%";},
+          cols:buckets.map(function(b,i){
+            const v=b[valueKey];
+            return {value:v,color:color,x:xLabel(b),label:show.has(i)?fmtPct0(v):null,
+              aria:tipTitle(b)+": "+fmtPct(v),
+              tip:{title:tipTitle(b),rows:tipRows(b,v)}};
+          }),
+          ref:hasT?{value:target,label:"Meta "+fmtPct(target)}:null,
+          legend:hasT?[{color:color,label:hostId==="trendAvail"?"Disponibilidade":"Eficiência"},{line:true,label:"Meta "+fmtPct(target)}]:[]
+        });
+      };
+      build("trendAvail","availability_percent","var(--series-2)",t.availability_percent,function(b,v){
+        return [{color:"var(--series-2)",label:"Disponibilidade",value:fmtPct(v)},
+                {label:"Indisponibilidade",value:fmtShort(b.unavailability_seconds)},
+                {label:"Jornada",value:fmtShort(b.journey_seconds)}];
+      });
+      build("trendEff","efficiency_percent","var(--series-1)",t.efficiency_percent,function(b,v){
+        return [{color:"var(--series-1)",label:"Eficiência",value:fmtPct(v)},
+                {label:"Perda de eficiência",value:fmtShort(b.efficiency_loss_seconds)},
+                {label:"Produzindo",value:fmtShort(b.running_seconds)}];
+      });
+      $("trendTable").innerHTML=tableTwin("tbl-trend","Ver evolução como tabela",
+        [gran==="month"?"Mês":(gran==="week"?"Semana":"Dia"),"Jornada","Indisponibilidade","Disponibilidade","Produzindo","Perda de eficiência","Eficiência"],
+        buckets.map(function(b){
+          return [gran==="month"?fmtMonth(b.key):(gran==="week"?"Semana de "+fmtDay(b.key):fmtDayFull(b.key)),
+            fmtShort(b.journey_seconds),fmtShort(b.unavailability_seconds),fmtPct(b.availability_percent),
+            fmtShort(b.running_seconds),fmtShort(b.efficiency_loss_seconds),fmtPct(b.efficiency_percent)];
+        }),1);
+    }
+
     function renderGestao(data){
-      $("kpiAvailability").textContent=fmtPct(data.period.availability_percent);
-      $("kpiRunning").textContent=fmtShort(data.period.running_seconds);
-      $("kpiDowntime").textContent=fmtShort(data.period.downtime_seconds);
+      const k=data.kpi||{}, t=data.targets||{}, b=data.breakdown||{};
+      const tooLong=daysBetween(data.period.start,data.period.end)>TIMELINE_MAX_DAYS;
+      const J=k.journey_seconds||0, U=k.unavailability_seconds||0, L=k.efficiency_loss_seconds||0;
+      renderUnclassNotice(k,tooLong);
+      $("indicators").innerHTML=
+        indicatorCard({cls:"avail",key:"avail",title:"Disponibilidade mecânica",
+          desc:"Quanto da jornada a usina esteve apta a produzir. Só entram quebras e falhas mecânicas ou elétricas.",
+          value:k.availability_percent,target:t.availability_percent,hasBase:J>0,
+          lostLabel:"Indisponibilidade",lostSeconds:U,lostPct:J>0?U/J*100:null,lostBase:"da jornada",
+          listTitle:"Motivos da indisponibilidade",rows:b.unavailability||[]})+
+        indicatorCard({cls:"eff",key:"eff",title:"Eficiência",
+          desc:"Do tempo em que a usina estava disponível, quanto foi realmente produzindo. As perdas vêm de fatores externos.",
+          value:k.efficiency_percent,target:t.efficiency_percent,hasBase:(J-U)>0,
+          lostLabel:"Perda de eficiência",lostSeconds:L,lostPct:(J-U)>0?L/(J-U)*100:null,lostBase:"do tempo disponível",
+          listTitle:"Motivos da perda de eficiência",rows:b.efficiency||[]});
+      renderExcluded(b.excluded||[]);
+
+      $("kpiJourney").textContent=fmtShort(J);
+      $("kpiRunning").textContent=fmtShort(k.running_seconds);
+      $("kpiUtil").textContent=fmtPct(k.utilization_percent);
+      $("kpiUnavail").textContent=fmtShort(U);
+      $("kpiLoss").textContent=fmtShort(L);
       $("kpiProduction").textContent=fmtM3(data.production_summary.total_m3);
-      renderTimeline(data.days||[]);
-      renderPareto(data.pareto||[]);
+
+      renderTrend(data);
+      renderTimeline(data.days||[],tooLong);
       fillReasonOptions(data.reasons||[]);
     }
 
-    function renderProducao(data){
-      renderProduction(data);
-      fillMixOptions(data.mix_catalog||[]);
-    }
-
-    function renderTimeline(days){
+    function renderTimeline(days,tooLong){
       const box=$("timelineDays");
       const today=localDate();
+      if(tooLong){
+        box.innerHTML='<div class="card empty">A linha do tempo detalhada aparece em períodos de até '+TIMELINE_MAX_DAYS+' dias. Os indicadores acima já somam o período inteiro. Para ver e corrigir paradas, escolha Hoje, Semana ou Mês.</div>';
+        return;
+      }
       if(!days.length){ box.innerHTML='<div class="empty">Sem dias no período selecionado.</div>'; return; }
 
       box.innerHTML=days.map(function(d){
@@ -243,27 +424,31 @@
           return '<article class="timeline-day card timeline-empty-day">'+
             '<div class="timeline-head"><div><strong>'+esc(d.date.split("-").reverse().join("/"))+'</strong>'+
             '<span>'+statusLabel+'</span></div>'+
-            '<div class="day-kpis"><b>—</b><span>não afeta a disponibilidade</span></div></div>'+
+            '<div class="day-kpis"><b>—</b><span>não entra nos indicadores</span></div></div>'+
             '<div class="timeline-track timeline-track-empty"><div class="timeline-empty-label">'+trackLabel+
             '</div></div></article>';
         }
 
+        const k=d.kpi||{};
         const startMs=new Date(d.detected_start_at).getTime(), endMs=new Date(d.detected_end_at).getTime();
         const span=Math.max(1,endMs-startMs);
         const segs=(d.timeline||[]).map(function(s){
           const a=Math.max(startMs,new Date(s.start_at).getTime());
           const b=Math.min(endMs,new Date(s.end_at).getTime());
           const left=Math.max(0,(a-startMs)/span*100), width=Math.max(.3,(b-a)/span*100);
-          const title=(s.type==="RUNNING"?"Produção":s.reason_label)+" · "+localTime(s.start_at)+"–"+localTime(s.end_at)+" · "+fmtShort(s.duration_seconds);
+          const what=s.type==="RUNNING"?"Produção":(s.reason_label+" ("+(CATEGORY_LABEL[s.category]||"")+")");
+          const title=what+" · "+localTime(s.start_at)+"–"+localTime(s.end_at)+" · "+fmtShort(s.duration_seconds);
           const click=s.type==="STOPPED"?' data-stop-key="'+esc(s.segment_key)+'" data-day="'+esc(d.date)+'"':'';
           return '<button class="timeline-segment '+(s.type==="RUNNING"?"run":"stop")+'" style="left:'+left+'%;width:'+width+'%;background:'+esc(s.color_hex||"#64748b")+'" title="'+esc(title)+'"'+click+'></button>';
         }).join("");
         return '<article class="timeline-day card">'+
           '<div class="timeline-head"><div><strong>'+esc(d.date.split("-").reverse().join("/"))+'</strong>'+
           '<span>'+localTime(d.detected_start_at)+' → '+localTime(d.detected_end_at)+'</span></div>'+
-          '<div class="day-kpis"><b>'+fmtPct(d.availability_percent)+'</b><span>'+fmtShort(d.running_seconds)+' rodando</span></div></div>'+
+          '<div class="day-kpis"><b>'+fmtPct(k.availability_percent)+'</b><span>disponibilidade</span><b>'+fmtPct(k.efficiency_percent)+'</b><span>eficiência</span></div></div>'+
           '<div class="timeline-track">'+segs+'</div>'+
-          '<div class="timeline-foot"><span>Programado: '+fmtShort(d.scheduled_seconds)+'</span><span>Parado: '+fmtShort(d.downtime_seconds)+'</span><span>Excluído da disponibilidade: '+fmtShort(d.excluded_availability_seconds||d.meal_seconds)+'</span>'+
+          '<div class="timeline-foot"><span>Jornada: '+fmtShort(k.journey_seconds)+'</span><span>Produzindo: '+fmtShort(k.running_seconds)+'</span>'+
+          '<span>Indisponibilidade: '+fmtShort(k.unavailability_seconds)+'</span><span>Perda de eficiência: '+fmtShort(k.efficiency_loss_seconds)+'</span>'+
+          '<span>Fora da jornada: '+fmtShort(k.excluded_seconds)+'</span>'+
           '<button class="link-btn edit-day" data-day="'+esc(d.date)+'">Editar jornada</button></div></article>';
       }).join("");
 
@@ -274,6 +459,121 @@
         el.addEventListener("click",function(){ openDayEditor(el.dataset.day); });
       });
     }
+
+
+    // ---------- Gráficos de colunas em HTML/CSS (sem biblioteca; seguem o tema por variáveis CSS) ----------
+    function openKeys(){
+      return Array.from(document.querySelectorAll("details[open][data-key]")).map(function(d){return d.dataset.key;});
+    }
+    function restoreOpen(keys){
+      keys.forEach(function(k){
+        const d=document.querySelector('details[data-key="'+k+'"]');
+        if(d) d.open=true;
+      });
+    }
+
+    function niceScale(maxV){
+      if(!(maxV>0)) return {max:1,ticks:[0,.25,.5,.75,1]};
+      const raw=maxV*1.12;
+      const exp=Math.pow(10,Math.floor(Math.log10(raw)));
+      const f=raw/exp;
+      const steps=[1,1.2,1.6,2,2.4,3,4,5,6,8,10];
+      let nf=10;
+      for(let i=0;i<steps.length;i++){ if(steps[i]>=f){ nf=steps[i]; break; } }
+      const max=nf*exp;
+      return {max:max,ticks:[0,max/4,max/2,max*3/4,max]};
+    }
+
+    function pickLabels(values,limit){
+      if(window.innerWidth<560) limit=Math.min(limit,5);
+      const set=new Set(), idx=[];
+      values.forEach(function(v,i){ if(v!==null && v!==undefined && Number.isFinite(v)) idx.push(i); });
+      if(idx.length<=limit){ idx.forEach(function(i){set.add(i);}); return set; }
+      let hi=idx[0], lo=idx[0];
+      idx.forEach(function(i){ if(values[i]>values[hi]) hi=i; if(values[i]<values[lo]) lo=i; });
+      set.add(hi); set.add(lo);
+      return set;
+    }
+
+    function ensureTip(){
+      if(!tipEl){
+        tipEl=document.createElement("div");
+        tipEl.className="viz-tip hidden";
+        tipEl.setAttribute("role","tooltip");
+        document.body.appendChild(tipEl);
+      }
+      return tipEl;
+    }
+    function hideTip(){ if(tipEl) tipEl.classList.add("hidden"); }
+    function showTip(target,tip){
+      const el=ensureTip();
+      el.innerHTML='<div class="tip-title">'+esc(tip.title)+'</div>'+tip.rows.map(function(r){
+        return '<div class="tip-row"><span class="tip-key'+(r.color?'':' none')+'"'+(r.color?' style="background:'+r.color+'"':'')+'></span>'+
+          '<span class="tip-label">'+esc(r.label)+'</span><b class="tip-val">'+esc(r.value)+'</b></div>';
+      }).join("");
+      el.classList.remove("hidden");
+      const rect=target.getBoundingClientRect(), tw=el.offsetWidth, th=el.offsetHeight;
+      let left=rect.left+rect.width/2-tw/2;
+      left=Math.max(8,Math.min(window.innerWidth-tw-8,left));
+      let top=rect.top-th-10;
+      if(top<8) top=Math.min(window.innerHeight-th-8,rect.bottom+10);
+      el.style.left=left+"px";
+      el.style.top=top+"px";
+    }
+    function bindTips(host){
+      if(host.dataset.tipBound) return;
+      host.dataset.tipBound="1";
+      const over=function(ev){
+        const c=ev.target.closest(".viz-col");
+        if(!c || !host.contains(c)) return;
+        const tip=host._tips && host._tips[Number(c.dataset.i)];
+        if(tip) showTip(c,tip);
+      };
+      host.addEventListener("mouseover",over);
+      host.addEventListener("focusin",over);
+      host.addEventListener("click",over);
+      host.addEventListener("mouseleave",hideTip);
+      host.addEventListener("focusout",hideTip);
+    }
+    document.addEventListener("click",function(ev){ if(!ev.target.closest(".viz-col")) hideTip(); });
+    window.addEventListener("scroll",hideTip,{passive:true});
+    document.addEventListener("keydown",function(ev){ if(ev.key==="Escape") hideTip(); });
+
+    // o = { cols:[{value,color,x,label,aria,tip:{title,rows:[{color,label,value}]}}], max, ticks, fmtTick, ref:{value,label}, legend:[{color,label,line}], plotH }
+    function columnChart(host,o){
+      hideTip();
+      const max=o.max, plotH=o.plotH||200;
+      const pos=function(v){ return Math.max(0,Math.min(100,v/max*100)); };
+      const yAxis=o.ticks.map(function(t){return '<span style="bottom:'+pos(t)+'%">'+esc(o.fmtTick(t))+'</span>';}).join("");
+      const grid=o.ticks.filter(function(t){return t>0;}).map(function(t){return '<i class="viz-grid" style="bottom:'+pos(t)+'%"></i>';}).join("");
+      const n=o.cols.length;
+      const cols=o.cols.map(function(c,i){
+        const has=c.value!==null && c.value!==undefined && Number.isFinite(c.value);
+        const h=has?pos(c.value):0;
+        return '<div class="viz-col" tabindex="0" data-i="'+i+'" role="img" aria-label="'+esc(c.aria||"")+'">'+
+          '<span class="viz-bar" style="height:'+h+'%;background:'+(has?c.color:"var(--border-strong)")+'"></span>'+
+          (c.label && has?'<span class="viz-val" style="bottom:calc('+h+'% + 4px)">'+esc(c.label)+'</span>':'')+
+          '</div>';
+      }).join("");
+      const step=n>24?3:(n>14?2:1);
+      const xAxis=o.cols.map(function(c,i){return '<span>'+(i%step===0?esc(c.x):"")+'</span>';}).join("");
+      const ref=o.ref?'<div class="viz-ref" style="bottom:'+pos(o.ref.value)+'%"></div>':"";
+      const legend=(o.legend&&o.legend.length)?'<div class="viz-legend">'+o.legend.map(function(l){
+        return '<span><i class="'+(l.line?'line':'')+'"'+(l.color?' style="background:'+l.color+'"':'')+'></i>'+esc(l.label)+'</span>';
+      }).join("")+'</div>':"";
+      host.innerHTML=legend+'<div class="viz" style="--plot-h:'+plotH+'px"><div class="viz-y">'+yAxis+'</div>'+
+        '<div class="viz-plot">'+grid+'<div class="viz-cols">'+cols+'</div>'+ref+'</div><div class="viz-x">'+xAxis+'</div></div>';
+      host._tips=o.cols.map(function(c){return c.tip;});
+      bindTips(host);
+    }
+
+    function tableTwin(key,summary,headers,rows,numFrom){
+      return '<details class="card how" data-key="'+esc(key)+'"><summary>'+esc(summary)+'</summary><div class="how-body reason-table"><div style="overflow:auto"><table><thead><tr>'+
+        headers.map(function(h,i){return '<th'+(i>=numFrom?' class="num"':'')+'>'+esc(h)+'</th>';}).join("")+'</tr></thead><tbody>'+
+        rows.map(function(r){return '<tr>'+r.map(function(c,i){return '<td'+(i>=numFrom?' class="num"':'')+'>'+esc(c)+'</td>';}).join("")+'</tr>';}).join("")+
+        '</tbody></table></div></div></details>';
+    }
+
 
     function openStopEditor(day,key){
       const ovw=overviews.gestao;
@@ -355,33 +655,39 @@
       }catch(e){ setStatus(e.message,"badtext"); }
     }
 
+    // Mesma regra do servidor: define em qual grupo cada motivo cai.
+    function reasonGroup(r){
+      if(r.reason_code==="UNCLASSIFIED" || r.category==="unclassified") return "unclassified";
+      if(r.affects_availability===false) return "excluded";
+      return r.category==="unavailability"?"unavailability":"efficiency";
+    }
+    const REASON_GROUPS = [
+      ["unavailability","Indisponibilidade — mecânica ou elétrica"],
+      ["efficiency","Perda de eficiência — fatores externos"],
+      ["excluded","Fora da jornada — não conta"],
+      ["unclassified","Sem classificação"]
+    ];
+
     function fillReasonOptions(rows){
       const select=$("stopReason");
       const current=select.value;
-      select.innerHTML=rows.map(function(r){return '<option value="'+esc(r.reason_code)+'">'+esc(r.label)+(r.affects_availability===false?" · não afeta disponibilidade":"")+'</option>';}).join("");
+      select.innerHTML=REASON_GROUPS.map(function(g){
+        const items=rows.filter(function(r){return reasonGroup(r)===g[0];});
+        if(!items.length) return "";
+        return '<optgroup label="'+esc(g[1])+'">'+items.map(function(r){
+          return '<option value="'+esc(r.reason_code)+'">'+esc(r.label)+'</option>';
+        }).join("")+'</optgroup>';
+      }).join("");
       if(current && rows.some(function(r){return r.reason_code===current;})) select.value=current;
-    }
-
-    function renderPareto(rows){
-      const labels=rows.map(function(r){return r.label;});
-      const hours=rows.map(function(r){return r.seconds/3600;});
-      const colors=rows.map(function(r){return r.color_hex||"#64748b";});
-      if(paretoChart) paretoChart.destroy();
-      paretoChart=new Chart($("paretoChart"),{
-        type:"bar",
-        data:{labels:labels,datasets:[{label:"Horas",data:hours,backgroundColor:colors}]},
-        options:{indexAxis:"y",responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{beginAtZero:true,ticks:{color:chartMuted()},grid:{color:chartGrid()}},y:{ticks:{color:chartText()},grid:{display:false}}}}
-      });
-      $("paretoEmpty").classList.toggle("hidden",rows.length>0);
     }
 
     function renderComponents(rows){
       $("componentsGrid").innerHTML=rows.map(function(c){
         const label=Number(c.motor_id)===2?"Correia Transportadora":c.name;
         return '<article class="card component-card"><div class="card-head"><h3>'+esc(label)+'</h3><span class="state '+(c.running?"running":"stopped")+'">'+(c.running?"● LIGADO":"● PARADO")+'</span></div>'+
-          '<div class="component-main"><span>Disponibilidade no período</span><strong>'+fmtPct(c.availability_percent)+'</strong></div>'+
+          '<div class="component-main"><span>Tempo ligado na jornada</span><strong>'+fmtPct(c.availability_percent)+'</strong></div>'+
           '<div class="mini-grid"><div><span>Horímetro individual</span><strong>'+fmtSec(c.hourmeter_seconds)+'</strong></div>'+
-          '<div><span>Horas rodadas no período</span><strong>'+fmtShort(c.period_running_seconds)+'</strong></div></div></article>';
+          '<div><span>Horas ligado no período</span><strong>'+fmtShort(c.period_running_seconds)+'</strong></div></div></article>';
       }).join("");
     }
 
@@ -393,33 +699,189 @@
       }
     }
 
+    // ---------- Produção ----------
+    function renderProducao(data){
+      renderProduction(data);
+      fillMixOptions(data.mix_catalog||[]);
+    }
+
     function renderProduction(data){
-      $("prodTotal").textContent=fmtM3(data.production_summary.total_m3);
-      $("prodTrucks").textContent=data.production_summary.trucks_count||0;
-      $("prodLoads").textContent=data.production_summary.loads_count||0;
-      $("prodRate").textContent=data.production_summary.m3_per_running_hour==null?"N/D":Number(data.production_summary.m3_per_running_hour).toLocaleString("pt-BR",{maximumFractionDigits:1})+" m³/h";
+      const sum=data.production_summary||{}, hr=data.production_hourly||{};
+      $("prodTotal").textContent=fmtM3(sum.total_m3);
+      $("prodTrucks").textContent=sum.trucks_count||0;
+      $("prodLoads").textContent=sum.loads_count||0;
+      $("prodRate").textContent=hr.avg_m3_per_running_hour==null?"N/D":fmtRate(hr.avg_m3_per_running_hour)+" m³/h";
+      $("prodRateSub").textContent=hr.days_counted?"média de "+plural(hr.days_counted,"dia","dias")+", só horas produzindo":"precisa de produção e horas de operação no mesmo dia";
+      $("prodRateJ").textContent=hr.avg_m3_per_journey_hour==null?"N/D":fmtRate(hr.avg_m3_per_journey_hour)+" m³/h";
+      $("prodBest").textContent=hr.best_day?fmtRate(hr.best_day.value)+" m³/h":"N/D";
+      $("prodBestSub").textContent=hr.best_day?fmtDayFull(hr.best_day.date):"";
+      $("prodWorst").textContent=hr.worst_day?fmtRate(hr.worst_day.value)+" m³/h":"N/D";
+      $("prodWorstSub").textContent=hr.worst_day?fmtDayFull(hr.worst_day.date):"";
 
       const dayMap=new Map((data.days||[]).map(function(d){return [d.date,d];}));
+      const rateMap=new Map((data.production_daily||[]).map(function(d){return [d.date,d];}));
       const rows=data.production||[];
       $("productionBody").innerHTML=rows.length?rows.map(function(p){
-        const day=dayMap.get(p.operation_date);
+        const day=dayMap.get(p.operation_date), pd=rateMap.get(p.operation_date);
         return '<tr><td>'+esc(p.operation_date.split("-").reverse().join("/"))+'</td><td>'+esc(p.mix_name)+'</td><td>'+fmtM3(p.volume_m3)+'</td>'+
           '<td>'+(p.trucks_count==null?"--":p.trucks_count)+'</td><td>'+(p.loads_count==null?"--":p.loads_count)+'</td>'+
           '<td>'+(day?fmtShort(day.running_seconds):"--")+'</td>'+
+          '<td>'+(pd&&pd.m3_per_running_hour!=null?fmtRate(pd.m3_per_running_hour):"--")+'</td>'+
           '<td><button class="small-btn edit-prod" data-id="'+p.id+'">Editar</button> <button class="small-btn danger delete-prod" data-id="'+p.id+'">Excluir</button></td></tr>';
-      }).join(""):'<tr><td colspan="7" class="empty">Ainda não há produção lançada no período.</td></tr>';
+      }).join(""):'<tr><td colspan="8" class="empty">Ainda não há produção lançada no período.</td></tr>';
 
       $("productionBody").querySelectorAll(".edit-prod").forEach(function(b){b.addEventListener("click",function(){editProduction(Number(b.dataset.id));});});
       $("productionBody").querySelectorAll(".delete-prod").forEach(function(b){b.addEventListener("click",function(){deleteProduction(Number(b.dataset.id));});});
 
-      const byDay={};
-      rows.forEach(function(p){byDay[p.operation_date]=(byDay[p.operation_date]||0)+Number(p.volume_m3||0);});
-      const labels=Object.keys(byDay).sort(), vals=labels.map(function(k){return byDay[k];});
-      if(productionChart) productionChart.destroy();
-      productionChart=new Chart($("productionChart"),{
-        type:"bar",data:{labels:labels.map(function(x){return x.slice(8,10)+"/"+x.slice(5,7);}),datasets:[{label:"m³",data:vals}]},
-        options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{color:chartText()},grid:{display:false}},y:{beginAtZero:true,ticks:{color:chartMuted()},grid:{color:chartGrid()}}}}
+      renderProdChart(data);
+    }
+
+    function renderProdChart(data){
+      const host=$("prodChart");
+      const today=localDate();
+      const hr=data.production_hourly||{};
+      const daily=(data.production_daily||[]).filter(function(d){return d.date<=today;});
+      const monthMode=daily.length>TIMELINE_MAX_DAYS;
+      const rate=prodView==="rate";
+      const unit=monthMode?"mês":"dia";
+
+      $("prodChartTitle").textContent=rate?"Produção por hora, "+unit+" a "+unit:"Volume produzido por "+unit;
+      $("prodChartSub").textContent=rate
+        ?(monthMode?"Cada barra é a média das taxas diárias do mês (m³ por hora com a usina produzindo). ":"m³ por hora com a usina produzindo, calculado dia a dia. ")+"A linha é a média dos dias do período; dias sem produção lançada ficam de fora."
+        :"m³ lançados em cada "+unit+". A linha é a média das barras com produção.";
+
+      const items=monthMode
+        ?(hr.months||[]).map(function(m){
+            return {x:fmtMonth(m.month),title:fmtMonth(m.month)+" · "+plural(m.days_counted,"dia","dias")+" com produção",
+              value:rate?m.avg_m3_per_running_hour:m.total_m3,
+              rows:rate
+                ?[["Média m³/h produzindo",fmtRate(m.avg_m3_per_running_hour)],["Média m³/h da jornada",fmtRate(m.avg_m3_per_journey_hour)],["Produção total",fmtM3(m.total_m3)]]
+                :[["Produção total",fmtM3(m.total_m3)],["Média m³/h produzindo",fmtRate(m.avg_m3_per_running_hour)],["Dias com produção",String(m.days_counted)]]};
+          })
+        :daily.map(function(d){
+            const vol=d.volume_m3;
+            return {x:daily.length>12?d.date.slice(8,10):fmtDay(d.date),title:weekdayShort(d.date)+" "+fmtDayFull(d.date),
+              value:rate?d.m3_per_running_hour:(vol>0?vol:null),
+              rows:rate
+                ?[["m³/h produzindo",fmtRate(d.m3_per_running_hour)],["m³/h da jornada",fmtRate(d.m3_per_journey_hour)],["Produção",vol==null?"não lançada":fmtM3(vol)],["Horas produzindo",fmtShort(d.running_seconds)],["Jornada",fmtShort(d.journey_seconds)]]
+                :[["Produção",vol==null?"não lançada":fmtM3(vol)],["m³/h produzindo",fmtRate(d.m3_per_running_hour)],["Horas produzindo",fmtShort(d.running_seconds)],["Jornada",fmtShort(d.journey_seconds)]]};
+          });
+
+      renderProdNotes(daily);
+      renderProdTable(daily,hr,monthMode);
+
+      const valid=items.filter(function(it){return it.value!==null && it.value!==undefined && Number.isFinite(it.value);});
+      if(!valid.length){
+        host.innerHTML='<div class="empty-note">Sem dados suficientes no período: é preciso ter produção lançada e horas de operação no mesmo dia.</div>';
+        host._tips=[];
+        return;
+      }
+      const avg=rate&&hr.avg_m3_per_running_hour!=null
+        ?hr.avg_m3_per_running_hour
+        :valid.reduce(function(s,it){return s+it.value;},0)/valid.length;
+      const sc=niceScale(Math.max(avg,Math.max.apply(null,valid.map(function(it){return it.value;}))));
+      const vals=items.map(function(it){return it.value;});
+      const show=pickLabels(vals,10);
+      const fmtV=function(v){return rate?fmtRate(v):fmtNum(v,0);};
+      const colorOf=function(v){return v>=avg?"var(--series-1)":"var(--bar-neutral)";};
+
+      columnChart(host,{
+        max:sc.max,ticks:sc.ticks,fmtTick:function(v){return fmtNum(v,2);},plotH:240,
+        cols:items.map(function(it,i){
+          const v=it.value, has=v!==null && v!==undefined && Number.isFinite(v);
+          const color=has?colorOf(v):"var(--border-strong)";
+          const rows=it.rows.map(function(r,ri){return {color:ri===0&&has?color:null,label:r[0],value:r[1]};});
+          if(has) rows.push({label:"Em relação à média",value:(v>=avg?"+":"−")+fmtNum(Math.abs(v/avg-1)*100,1)+"%"});
+          return {value:has?v:null,color:color,x:it.x,label:show.has(i)?fmtV(v):null,
+            aria:it.title+": "+(has?fmtV(v)+(rate?" m³/h":" m³"):"sem dados"),
+            tip:{title:it.title,rows:rows}};
+        }),
+        ref:{value:avg},
+        legend:[{color:"var(--series-1)",label:"Na média ou acima"},{color:"var(--bar-neutral)",label:"Abaixo da média"},{line:true,label:"Média do período: "+fmtV(avg)+(rate?" m³/h":" m³")}]
       });
+    }
+
+    function renderProdNotes(daily){
+      const box=$("prodMissing");
+      const today=localDate();
+      const noProd=daily.filter(function(d){return d.has_activity && d.volume_m3==null && d.date<today;});
+      const noHours=daily.filter(function(d){return d.volume_m3>0 && d.m3_per_running_hour==null;});
+      const list=function(arr){
+        const shown=arr.slice(0,10).map(function(d){return fmtDay(d.date);}).join(", ");
+        return shown+(arr.length>10?" e mais "+(arr.length-10):"");
+      };
+      const parts=[];
+      if(noProd.length) parts.push("<b>"+plural(noProd.length,"dia com a usina operando","dias com a usina operando")+" sem produção lançada</b> ("+list(noProd)+"). Eles ficam de fora da média.");
+      if(noHours.length) parts.push("<b>"+plural(noHours.length,"dia com produção lançada","dias com produção lançada")+" mas sem horas de operação detectadas</b> ("+list(noHours)+"). Também ficam de fora da média.");
+      if(!parts.length){ box.innerHTML=""; return; }
+      box.innerHTML='<div class="notice"><span class="ico">ℹ</span><div>'+parts.join("<br>")+'</div></div>';
+    }
+
+    function renderProdTable(daily,hr,monthMode){
+      const box=$("prodDaily");
+      if(monthMode){
+        const months=hr.months||[];
+        box.innerHTML=months.length?tableTwin("tbl-prod","Ver como tabela",
+          ["Mês","Dias com produção","Produção (m³)","m³/h produzindo (média)","m³/h da jornada (média)"],
+          months.map(function(m){return [fmtMonth(m.month),String(m.days_counted),fmtNum(m.total_m3,1),fmtRate(m.avg_m3_per_running_hour),fmtRate(m.avg_m3_per_journey_hour)];}),1):"";
+        return;
+      }
+      const rows=daily.filter(function(d){return d.has_activity || d.volume_m3!=null;});
+      box.innerHTML=rows.length?tableTwin("tbl-prod","Ver como tabela",
+        ["Data","Produção (m³)","Horas produzindo","Jornada","m³/h produzindo","m³/h da jornada"],
+        rows.map(function(d){return [fmtDayFull(d.date),d.volume_m3==null?"—":fmtNum(d.volume_m3,1),fmtShort(d.running_seconds),fmtShort(d.journey_seconds),fmtRate(d.m3_per_running_hour),fmtRate(d.m3_per_journey_hour)];}),1):"";
+    }
+
+    // ---------- Metas ----------
+    function renderTargets(data){
+      const t=data.targets||{};
+      [["targetAvail",t.availability_percent],["targetEff",t.efficiency_percent]].forEach(function(p){
+        const el=$(p[0]);
+        if(el.dataset.dirty!=="1") el.value=(p[1]===null||p[1]===undefined)?"":String(p[1]);
+      });
+      $("targetsInfo").textContent=t.updated_at?"Última alteração: "+localDateTime(t.updated_at):"Nenhuma meta definida ainda.";
+      renderClassification(data.reasons||[]);
+    }
+
+    function renderClassification(reasons){
+      const desc={
+        unavailability:"Fator mecânico ou elétrico que impede a usina de funcionar. Reduz a disponibilidade.",
+        efficiency:"Fator externo, sem relação com a integridade da usina. Reduz a eficiência.",
+        excluded:"Fora da jornada: não entra em nenhum indicador (ex.: refeição).",
+        unclassified:"Parada ainda sem motivo. Conta como perda de eficiência até ser classificada."
+      };
+      $("classifGrid").innerHTML=REASON_GROUPS.map(function(g){
+        const items=reasons.filter(function(r){return reasonGroup(r)===g[0] && r.reason_code!=="UNCLASSIFIED";});
+        const list=g[0]==="unclassified"
+          ?"<li>Paradas sem motivo escolhido</li>"
+          :(items.length?items.map(function(r){return "<li>"+esc(r.label)+"</li>";}).join(""):"<li>Nenhum motivo</li>");
+        return '<article class="card classif-card"><h3>'+esc(CATEGORY_LABEL[g[0]])+'</h3><p class="muted">'+esc(desc[g[0]])+'</p><ul>'+list+'</ul></article>';
+      }).join("");
+    }
+
+    function parseTarget(text){
+      const s=String(text==null?"":text).trim().replace(",",".");
+      if(s==="") return null;
+      const n=Number(s);
+      if(!Number.isFinite(n) || n<0 || n>100) throw new Error("Meta inválida: use um valor de 0 a 100.");
+      return n;
+    }
+
+    async function saveTargets(){
+      try{
+        requirePin("metaPin");
+        const body={kind:"save_targets",availability_percent:parseTarget($("targetAvail").value),efficiency_percent:parseTarget($("targetEff").value)};
+        setStatus("Salvando metas...","pending");
+        const out=await mgmt(body,"metaPin");
+        const t=out.targets||{};
+        ["targetAvail","targetEff"].forEach(function(id){ $(id).dataset.dirty="0"; });
+        Object.keys(overviews).forEach(function(k){
+          if(overviews[k]) overviews[k].targets=Object.assign({},overviews[k].targets,t);
+        });
+        setStatus("Metas salvas e auditadas.","oktxt");
+        await loadOverview("metas");
+        if(overviews.gestao) renderGestao(overviews.gestao);
+      }catch(e){ setStatus(e.message,"badtext"); }
     }
 
     function editProduction(id){
@@ -484,6 +946,8 @@
 
     function switchTab(name){
       activeTab=name;
+      hideTip();
+      setStatus("");
       document.querySelectorAll(".tab-btn").forEach(function(b){b.classList.toggle("active",b.dataset.tab===name);});
       document.querySelectorAll(".tab-page").forEach(function(p){p.classList.toggle("active",p.id==="tab-"+name);});
       if(name!=="operation") loadOverview(TAB_SCOPE[name]);
@@ -495,17 +959,23 @@
       b.title=isLight()?"Usar modo escuro":"Usar modo claro";
       b.setAttribute("aria-label",b.title);
     }
+    // Os gráficos usam variáveis CSS, então acompanham o tema sem precisar redesenhar.
     $("themeBtn").addEventListener("click",function(){
       const next=isLight()?"dark":"light";
       document.documentElement.dataset.theme=next;
       try{localStorage.setItem("uc0012-theme",next);}catch(e){}
       updateThemeBtn();
-      if(overviews.gestao) renderPareto(overviews.gestao.pareto||[]);
-      if(overviews.producao) renderProduction(overviews.producao);
     });
 
     document.querySelectorAll(".tab-btn").forEach(function(b){b.addEventListener("click",function(){switchTab(b.dataset.tab);});});
     document.querySelectorAll(".period-btn").forEach(function(b){b.addEventListener("click",function(){applyQuickPeriod(b.dataset.scope,b.dataset.mode);});});
+    document.querySelectorAll(".seg-btn[data-view]").forEach(function(b){
+      b.addEventListener("click",function(){
+        prodView=b.dataset.view;
+        document.querySelectorAll(".seg-btn[data-view]").forEach(function(x){x.classList.toggle("active",x===b);});
+        if(overviews.producao) renderProdChart(overviews.producao);
+      });
+    });
     $("applyGestao").addEventListener("click",function(){setPillsActive("gestao","custom");loadOverview("gestao");});
     $("applyComp").addEventListener("click",function(){setPillsActive("componentes","custom");loadOverview("componentes");});
     $("applyProd").addEventListener("click",function(){setPillsActive("producao","custom");loadOverview("producao");});
@@ -519,10 +989,19 @@
     $("cancelDay").addEventListener("click",function(){$("dayEditor").classList.add("hidden");});
     $("saveProduction").addEventListener("click",saveProduction);
     $("cancelProductionEdit").addEventListener("click",clearProductionForm);
+    $("saveTargets").addEventListener("click",saveTargets);
+    ["targetAvail","targetEff"].forEach(function(id){
+      $(id).addEventListener("input",function(){ $(id).dataset.dirty="1"; });
+    });
+    // A aba Metas usa o PIN da Gestão: os dois campos acompanham um ao outro.
+    [["gestaoPin","metaPin"],["metaPin","gestaoPin"]].forEach(function(p){
+      $(p[0]).addEventListener("input",function(){ $(p[1]).value=$(p[0]).value; });
+    });
 
     updateThemeBtn();
     const today=localDate();
     Object.keys(SCOPES).forEach(function(scope){
+      if(!SCOPES[scope].start) return;
       $(SCOPES[scope].start).value=today;
       $(SCOPES[scope].end).value=today;
     });
@@ -533,6 +1012,7 @@
       if(document.visibilityState==="visible") loadOverview(currentScope());
     },30000);
   </script>
+
   <style>
     :root{
       color-scheme:dark;
@@ -719,22 +1199,10 @@
     .save-status.badtext{color:var(--bad-text)}
 
     /* Gráficos e análises */
-    .pareto-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(260px,1fr);gap:14px}
-    .chart-card{min-height:380px;display:flex;flex-direction:column}
-    .chart-card h3{margin:0 0 12px;font-size:15px;font-weight:700}
-    .chart-wrap{position:relative;flex:1;min-height:300px}
-    .legend-note{line-height:1.6}
-    .legend-note strong{display:block;margin-bottom:8px;font-size:15px}
-    .legend-note p{margin:0 0 10px}
     .production-summary{margin-bottom:2px}
-    .production-layout{display:grid;grid-template-columns:minmax(320px,.8fr) minmax(0,1.2fr);gap:14px;align-items:start}
-    .production-layout .card h3{margin:0 0 14px;font-size:15px;font-weight:700}
 
     .footer{text-align:center;color:var(--muted);font-size:12px;padding:28px 12px 8px}
 
-    @media (max-width:1000px){
-      .pareto-grid,.production-layout{grid-template-columns:1fr}
-    }
     @media (max-width:800px){
       .wrap{padding:14px 12px 32px}
       .topbar{margin:-14px -12px 14px;padding:12px}
@@ -746,6 +1214,130 @@
       .timeline-track{height:48px}
       .card{padding:14px}
       .editor{width:calc(100vw - 24px);padding:18px}
+    }
+  
+    /* ===== Indicadores: disponibilidade e eficiência ===== */
+    :root{--series-1:#3987e5;--series-2:#d95926;--bar-neutral:#5f7494}
+    [data-theme="light"]{--series-1:#2a78d6;--series-2:#eb6834;--bar-neutral:#8193ad}
+
+    .notice{display:flex;gap:10px;align-items:flex-start;padding:12px 14px;margin:0 0 14px;border:1px solid var(--border-strong);border-left:3px solid var(--warn-text);border-radius:var(--radius-sm);background:var(--surface);font-size:13px;line-height:1.5}
+    .notice .ico{font-weight:800;color:var(--warn-text)}
+    .indicator-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;align-items:stretch}
+    .summary-tiles{grid-template-columns:repeat(auto-fit,minmax(190px,1fr))}
+    .production-summary{margin-top:14px;grid-template-columns:repeat(auto-fit,minmax(160px,1fr))}
+    .production-summary .kpi strong{font-size:21px}
+    .indicator{--hue:var(--series-1);padding:20px}
+    .indicator.avail{--hue:var(--series-2)}
+    .indicator.eff{--hue:var(--series-1)}
+    .ind-head{display:flex;justify-content:space-between;gap:12px;align-items:flex-start}
+    .ind-head h3{margin:0 0 4px;font-size:16px;font-weight:700}
+    .ind-head p{margin:0;max-width:46ch}
+    .ind-figure{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:16px 0 12px}
+    .ind-figure strong{font-size:44px;line-height:1;font-weight:800;letter-spacing:-.02em}
+    .target-chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;padding:5px 11px;border-radius:999px}
+    .target-chip.ok{background:var(--ok-soft);color:var(--ok-text)}
+    .target-chip.bad{background:var(--bad-soft);color:var(--bad-text)}
+    .target-chip.none{background:var(--surface-3);color:var(--muted)}
+    .meter-wrap{position:relative;padding:5px 0}
+    .meter-wrap.has-target{padding-bottom:24px}
+    .meter{position:relative;height:8px;border-radius:999px;background:color-mix(in srgb,var(--hue) 20%,transparent)}
+    .meter-fill{display:block;height:100%;border-radius:999px;background:var(--hue);min-width:0;max-width:100%}
+    .meter-target{position:absolute;top:-5px;bottom:-5px;width:2px;margin-left:-1px;background:var(--text);border-radius:1px}
+    .meter-target-label{position:absolute;bottom:2px;transform:translateX(-50%);font-size:11px;font-weight:700;color:var(--text-2);white-space:nowrap}
+    .ind-sub{margin-top:6px}
+    .ind-sub b{color:var(--text)}
+    .ind-sub-title{margin:20px 0 8px;font-size:12px;font-weight:700;color:var(--text-2);text-transform:uppercase;letter-spacing:.06em}
+    .reason-list{display:grid;gap:11px}
+    .reason-row{display:grid;grid-template-columns:minmax(110px,38%) minmax(0,1fr) auto;gap:12px;align-items:center;font-size:13px}
+    .reason-name{color:var(--text-2);line-height:1.3}
+    .reason-track{display:block;height:10px}
+    .reason-bar{display:block;height:100%;min-width:3px;background:var(--hue);border-radius:0 4px 4px 0}
+    .reason-row.unclassified .reason-bar{background:var(--bar-neutral)}
+    .reason-row.unclassified .reason-name{color:var(--warn-text)}
+    .reason-val{white-space:nowrap;font-variant-numeric:tabular-nums}
+    .reason-val b{font-weight:700;color:var(--text)}
+    .reason-val small{color:var(--muted);font-size:12px;font-weight:600}
+    .empty-note{color:var(--muted);font-size:13px;padding:6px 0}
+    .reason-table table{min-width:0}
+    .reason-table th,.reason-table td{padding:8px 8px;font-size:12px}
+    .reason-table td.num,.reason-table th.num{text-align:right;font-variant-numeric:tabular-nums}
+    .reason-table h5{margin:14px 0 6px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+    .excluded-strip{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:14px;padding:12px 16px}
+    .excluded-strip strong{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--text-2)}
+    .chip{display:inline-flex;gap:6px;align-items:baseline;background:var(--surface-3);border-radius:999px;padding:4px 11px;font-size:12px;color:var(--text-2)}
+    .chip b{color:var(--text);font-variant-numeric:tabular-nums}
+    .summary-tiles{margin-top:14px}
+    .kpi small{display:block;margin-top:6px;color:var(--muted);font-size:12px}
+    .how{margin-top:14px;padding:0}
+    .how summary{cursor:pointer;padding:14px 18px;font-weight:700;color:var(--text-2)}
+    .how .how-body{padding:0 18px 16px;font-size:13px;line-height:1.6;color:var(--text-2)}
+    .how .how-body p{margin:0 0 8px}
+
+    /* Gráficos de colunas (HTML/CSS) */
+    .viz-host{position:relative;width:100%}
+    .viz{margin-top:24px;display:grid;grid-template-columns:42px minmax(0,1fr);grid-template-rows:var(--plot-h,200px) auto;column-gap:8px}
+    .viz-y{position:relative}
+    .viz-y span{position:absolute;right:0;transform:translateY(50%);font-size:11px;line-height:1;color:var(--muted);font-variant-numeric:tabular-nums}
+    .viz-plot{position:relative;border-bottom:1px solid var(--border-strong)}
+    .viz-grid{position:absolute;left:0;right:0;height:0;border-top:1px solid var(--border)}
+    .viz-cols{position:absolute;inset:0;display:flex;gap:2px;align-items:stretch}
+    .viz-col{position:relative;flex:1 1 0;min-width:0;display:flex;justify-content:center;align-items:flex-end;border-radius:4px;outline-offset:-2px}
+    .viz-col:hover{background:color-mix(in srgb,var(--text) 6%,transparent)}
+    .viz-col:focus-visible{outline:2px solid var(--accent)}
+    .viz-bar{display:block;width:100%;max-width:24px;min-height:2px;border-radius:4px 4px 0 0;transition:filter .12s}
+    .viz-col:hover .viz-bar,.viz-col:focus-visible .viz-bar{filter:brightness(1.14)}
+    .viz-val{z-index:2;padding:0 2px;border-radius:3px;background:var(--surface);position:absolute;left:50%;transform:translateX(-50%);font-size:11px;font-weight:700;color:var(--text);white-space:nowrap;pointer-events:none}
+    .viz-ref{position:absolute;left:0;right:0;height:0;border-top:2px solid var(--text);pointer-events:none}
+    .viz-x{grid-column:2;display:flex;gap:2px;padding-top:6px}
+    .viz-x span{flex:1 1 0;min-width:0;text-align:center;font-size:11px;color:var(--muted);white-space:nowrap}
+    .viz-legend{display:flex;gap:16px;flex-wrap:wrap;margin:2px 0 12px;font-size:12px;color:var(--text-2)}
+    .viz-legend span{display:inline-flex;gap:7px;align-items:center}
+    .viz-legend i{display:inline-block;width:12px;height:12px;border-radius:3px}
+    .viz-legend i.line{height:0;width:16px;border-top:2px solid var(--text);border-radius:0}
+    .viz-tip{position:fixed;z-index:80;min-width:170px;max-width:290px;padding:10px 12px;border-radius:10px;background:var(--surface);border:1px solid var(--border-strong);box-shadow:0 8px 28px rgba(0,0,0,.28);pointer-events:none;font-size:12px}
+    .tip-title{color:var(--text-2);font-weight:600;margin-bottom:6px}
+    .tip-row{display:flex;align-items:center;gap:8px;padding:2px 0}
+    .tip-key{display:inline-block;width:10px;height:3px;border-radius:2px;flex:none}
+    .tip-key.none{background:transparent}
+    .tip-label{color:var(--text-2);flex:1}
+    .tip-val{color:var(--text);font-variant-numeric:tabular-nums}
+
+    /* Produção */
+    .prod-chart-card{margin-bottom:14px}
+    .chart-head{display:flex;justify-content:space-between;gap:14px;align-items:flex-start;flex-wrap:wrap;margin-bottom:14px}
+    .chart-head h3{margin:0 0 4px;font-size:16px;font-weight:700}
+    .chart-head p{margin:0}
+    .seg-ctl{display:inline-flex;gap:4px;padding:4px;background:var(--surface-2);border:1px solid var(--border);border-radius:12px;flex-wrap:wrap}
+    .seg-btn{border:0;background:transparent;box-shadow:none;padding:7px 14px;border-radius:9px;color:var(--muted);font-size:13px}
+    .seg-btn:hover:not(:disabled){color:var(--text);background:var(--surface-3)}
+    .seg-btn.active{background:var(--accent);color:#fff}
+    .seg-btn:disabled{opacity:.55;cursor:not-allowed}
+    .chart-foot{display:flex;justify-content:flex-end;margin-top:12px}
+    #prodMissing{margin-top:10px}
+    #prodDaily{margin-top:12px}
+    #prodDaily table{min-width:560px}
+    .production-form-card{max-width:760px;margin-bottom:6px}
+    .production-form-card h3{margin:0 0 14px;font-size:15px;font-weight:700}
+
+    /* Metas */
+    .targets-grid .filter input{width:100%}
+    .targets-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;max-width:760px}
+    .classif-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:14px}
+    .classif-card h3{margin:0 0 4px;font-size:15px;font-weight:700}
+    .classif-card p{margin:0 0 12px}
+    .classif-card ul{margin:0;padding-left:18px;font-size:13px;line-height:1.7;color:var(--text-2)}
+
+    @media (max-width:1000px){
+      .indicator-grid{grid-template-columns:1fr}
+    }
+    @media (max-width:560px){
+      .ind-figure strong{font-size:38px}
+      .reason-row{grid-template-columns:minmax(0,1fr) auto;gap:6px 12px}
+      .reason-track{grid-column:1 / -1;grid-row:2}
+      .viz{grid-template-columns:34px minmax(0,1fr)}
+      .summary-tiles,.production-summary{grid-template-columns:repeat(2,minmax(0,1fr))}
+      .kpi strong{font-size:20px}
+      .kpi small{font-size:11px}
     }
   </style>
 </head>
@@ -765,6 +1357,7 @@
     <button class="tab-btn" data-tab="management">Gestão</button>
     <button class="tab-btn" data-tab="components">Componentes</button>
     <button class="tab-btn" data-tab="production">Produção</button>
+    <button class="tab-btn" data-tab="targets">Metas</button>
   </nav>
 
   <div id="saveStatus" class="save-status"></div>
@@ -795,6 +1388,7 @@
             <button class="period-btn active" data-scope="gestao" data-mode="today">Hoje</button>
             <button class="period-btn" data-scope="gestao" data-mode="week">Semana</button>
             <button class="period-btn" data-scope="gestao" data-mode="month">Mês</button>
+            <button class="period-btn" data-scope="gestao" data-mode="year">Ano</button>
           </div>
         </div>
         <div class="filters">
@@ -807,17 +1401,43 @@
       <div id="managementLoading" class="management-status">Carregando...</div>
     </article>
 
-    <h2 class="section-title">Disponibilidade da Usina</h2>
-    <section class="kpi-grid">
-      <article class="card kpi"><span>Disponibilidade</span><strong id="kpiAvailability">N/D</strong></article>
-      <article class="card kpi"><span>Horas trabalhadas</span><strong id="kpiRunning">--</strong></article>
-      <article class="card kpi"><span>Indisponibilidade</span><strong id="kpiDowntime">--</strong></article>
-      <article class="card kpi"><span>Produção no período</span><strong id="kpiProduction">0 m³</strong></article>
+    <div id="unclassNotice" class="notice hidden" style="margin-top:14px"></div>
+
+    <h2 class="section-title">Disponibilidade e eficiência da usina</h2>
+    <section id="indicators" class="indicator-grid"><div class="card empty">Carregando indicadores...</div></section>
+    <div id="excludedStrip" class="card excluded-strip hidden"></div>
+
+    <section class="kpi-grid summary-tiles">
+      <article class="card kpi"><span>Jornada</span><strong id="kpiJourney">--</strong><small>do 1º ao último ciclo, sem refeição</small></article>
+      <article class="card kpi"><span>Horas produzindo</span><strong id="kpiRunning">--</strong><small>usina com misturador ligado</small></article>
+      <article class="card kpi"><span>Utilização</span><strong id="kpiUtil">N/D</strong><small>produzindo ÷ jornada</small></article>
+      <article class="card kpi"><span>Indisponibilidade</span><strong id="kpiUnavail">--</strong><small>falha mecânica ou elétrica</small></article>
+      <article class="card kpi"><span>Perda de eficiência</span><strong id="kpiLoss">--</strong><small>fatores externos</small></article>
+      <article class="card kpi"><span>Produção no período</span><strong id="kpiProduction">0 m³</strong><small>volume lançado na aba Produção</small></article>
     </section>
-    <div class="small" style="margin-bottom:12px">Disponibilidade = horas trabalhadas ÷ jornada detectada/corrigida. <strong>Refeição e Sem operação são excluídos do tempo programado</strong>; os demais motivos de parada reduzem a disponibilidade.</div>
+
+    <details class="card how" data-key="how-calc">
+      <summary>Como os indicadores são calculados</summary>
+      <div class="how-body">
+        <p><b>Jornada:</b> do primeiro ao último ciclo da usina no dia (ou o horário corrigido em “Editar jornada”). Refeição e Sem operação ficam fora da jornada e não entram em nenhum indicador.</p>
+        <p><b>Disponibilidade mecânica</b> = (jornada − indisponibilidade) ÷ jornada. Indisponibilidade é o tempo parado por fator mecânico ou elétrico que impede a usina de funcionar.</p>
+        <p><b>Eficiência</b> = horas produzindo ÷ (jornada − indisponibilidade). A perda de eficiência é o tempo em que a usina estava apta, mas parada por fatores externos à sua integridade.</p>
+        <p><b>Utilização</b> = horas produzindo ÷ jornada. É o número que antes aparecia como “Disponibilidade” neste painel.</p>
+        <p>Paradas sem motivo contam como perda de eficiência até serem classificadas. A aba Metas mostra a classificação de cada motivo.</p>
+      </div>
+    </details>
+
+    <section id="trendSection" class="hidden">
+      <h2 class="section-title">Evolução no período</h2>
+      <div class="indicator-grid">
+        <article class="card"><div class="chart-head"><div><h3 id="trendAvailTitle">Disponibilidade</h3><p class="muted">Disponibilidade mecânica em cada intervalo. Toque numa coluna para ver as horas.</p></div></div><div id="trendAvail" class="viz-host"></div></article>
+        <article class="card"><div class="chart-head"><div><h3 id="trendEffTitle">Eficiência</h3><p class="muted">Eficiência em cada intervalo, sobre o tempo disponível. Toque numa coluna para ver as horas.</p></div></div><div id="trendEff" class="viz-host"></div></article>
+      </div>
+      <div id="trendTable"></div>
+    </section>
 
     <h2 class="section-title">Linha do tempo</h2>
-    <div class="small" style="margin:-4px 0 12px">Hoje mostra 1 dia. Semana mostra os 7 dias completos, de segunda a domingo. Mês mostra todos os dias do mês selecionado. Dias sem atividade e dias futuros aparecem apenas como referência e não entram na disponibilidade.</div>
+    <div class="small" style="margin:-4px 0 12px">Hoje mostra 1 dia. Semana mostra os 7 dias, de segunda a domingo. Mês mostra todos os dias do mês. Clique numa parada para corrigir o motivo e os horários: a alteração fica auditada e os eventos originais da HF-006 não são apagados. Dias sem atividade e dias futuros aparecem só como referência.</div>
     <div id="timelineDays"></div>
 
     <article id="stopEditor" class="card editor hidden">
@@ -840,12 +1460,6 @@
       </div>
       <div class="editor-actions"><button id="saveDay" class="primary">Salvar jornada</button><button id="cancelDay">Cancelar</button></div>
     </article>
-
-    <h2 class="section-title">Pareto das causas de parada</h2>
-    <section class="pareto-grid">
-      <article class="card chart-card"><div class="chart-wrap"><canvas id="paretoChart"></canvas></div><div id="paretoEmpty" class="empty">Sem paradas no período.</div></article>
-      <article class="card legend-note"><strong>Regra gerencial</strong><p class="muted">Refeição e Sem operação não entram na indisponibilidade nem no Pareto. Paradas não classificadas entram como perda até serem revisadas.</p><p class="muted">Clique em qualquer trecho de parada na linha do tempo para corrigir o motivo e os horários. A alteração fica auditada e os eventos originais da HF-006 não são apagados.</p></article>
-    </section>
   </section>
 
   <section id="tab-components" class="tab-page">
@@ -856,6 +1470,7 @@
             <button class="period-btn active" data-scope="componentes" data-mode="today">Hoje</button>
             <button class="period-btn" data-scope="componentes" data-mode="week">Semana</button>
             <button class="period-btn" data-scope="componentes" data-mode="month">Mês</button>
+            <button class="period-btn" data-scope="componentes" data-mode="year">Ano</button>
           </div>
         </div>
         <div class="filters">
@@ -866,8 +1481,8 @@
       </div>
       <div id="compLoading" class="management-status">Carregando...</div>
     </article>
-    <h2 class="section-title">Disponibilidade individual dos componentes</h2>
-    <div class="small" style="margin-bottom:12px">Usa o período selecionado nesta aba e exclui apenas a Refeição da jornada.</div>
+    <h2 class="section-title">Tempo ligado de cada componente</h2>
+    <div class="small" style="margin-bottom:12px">Mostra quanto tempo cada componente ficou ligado dentro da jornada do período (sem Refeição e Sem operação). Não é a disponibilidade mecânica da usina, que fica na aba Gestão.</div>
     <section id="componentsGrid" class="components-grid"></section>
   </section>
 
@@ -879,6 +1494,7 @@
             <button class="period-btn active" data-scope="producao" data-mode="today">Hoje</button>
             <button class="period-btn" data-scope="producao" data-mode="week">Semana</button>
             <button class="period-btn" data-scope="producao" data-mode="month">Mês</button>
+            <button class="period-btn" data-scope="producao" data-mode="year">Ano</button>
           </div>
         </div>
         <div class="filters">
@@ -890,35 +1506,68 @@
       <div id="prodLoading" class="management-status">Carregando...</div>
     </article>
     <section class="kpi-grid production-summary">
-      <article class="card kpi"><span>Produção</span><strong id="prodTotal">0 m³</strong></article>
+      <article class="card kpi"><span>Produção</span><strong id="prodTotal">0 m³</strong><small>volume lançado no período</small></article>
+      <article class="card kpi"><span>Média por hora</span><strong id="prodRate">N/D</strong><small id="prodRateSub"></small></article>
+      <article class="card kpi"><span>Média por hora de jornada</span><strong id="prodRateJ">N/D</strong><small>conta também as paradas</small></article>
+      <article class="card kpi"><span>Melhor dia</span><strong id="prodBest">N/D</strong><small id="prodBestSub"></small></article>
+      <article class="card kpi"><span>Pior dia</span><strong id="prodWorst">N/D</strong><small id="prodWorstSub"></small></article>
       <article class="card kpi"><span>Caminhões</span><strong id="prodTrucks">0</strong></article>
       <article class="card kpi"><span>Cargas / viagens</span><strong id="prodLoads">0</strong></article>
-      <article class="card kpi"><span>Produtividade</span><strong id="prodRate">N/D</strong></article>
     </section>
 
-    <section class="production-layout">
-      <article id="productionForm" class="card">
-        <h3 id="productionFormTitle">Adicionar produção</h3>
-        <div class="filter" style="margin-bottom:12px"><label class="small" for="producaoPin">PIN da produção</label><input id="producaoPin" class="pin-input" type="password" autocomplete="off" placeholder="PIN"></div>
-        <div class="production-form-grid">
-          <div class="filter"><label class="small">Data</label><input id="productionDate" type="date"></div>
-          <div class="filter"><label class="small">Traço / tipo de concreto</label><input id="mixName" list="mixOptions" placeholder="Pavimento Rígido"><datalist id="mixOptions"></datalist></div>
-          <div class="filter"><label class="small">Produção (m³)</label><input id="volumeM3" type="number" min="0" step="0.001"></div>
-          <div class="filter"><label class="small">Quantidade de caminhões</label><input id="trucksCount" type="number" min="0" step="1"></div>
-          <div class="filter"><label class="small">Cargas / viagens</label><input id="loadsCount" type="number" min="0" step="1"></div>
+    <article class="card prod-chart-card" style="margin-top:14px">
+      <div class="chart-head">
+        <div><h3 id="prodChartTitle">Produção por hora, dia a dia</h3><p id="prodChartSub" class="muted"></p></div>
+        <div class="seg-ctl" role="group" aria-label="O que mostrar no gráfico">
+          <button class="seg-btn active" type="button" data-view="rate">m³ por hora</button>
+          <button class="seg-btn" type="button" data-view="volume">Volume (m³)</button>
+          <button class="seg-btn" type="button" disabled aria-disabled="true" title="Produção por linha (Misturador A e B): ainda sem forma de medir">Por linha · em breve</button>
         </div>
-        <div class="filter" style="margin-top:10px"><label class="small">Observação</label><textarea id="productionNote" placeholder="Opcional"></textarea></div>
-        <div class="editor-actions"><button id="saveProduction" class="primary">Salvar produção</button><button id="cancelProductionEdit" class="hidden">Cancelar edição</button></div>
-        <div class="small" style="margin-top:10px">As horas rodadas são associadas automaticamente ao Horímetro Oficial da Usina no dia. Pavimento Rígido é o traço principal, mas novos traços podem ser digitados e ficam disponíveis para os próximos lançamentos.</div>
-      </article>
+      </div>
+      <div id="prodChart" class="viz-host"></div>
+      <div id="prodMissing"></div>
+      <div id="prodDaily"></div>
+    </article>
 
-      <article class="card chart-card"><h3>Produção por dia</h3><div class="chart-wrap"><canvas id="productionChart"></canvas></div></article>
-    </section>
+    <h2 class="section-title">Lançar produção</h2>
+    <article id="productionForm" class="card production-form-card">
+      <h3 id="productionFormTitle">Adicionar produção</h3>
+      <div class="filter" style="margin-bottom:12px"><label class="small" for="producaoPin">PIN da produção</label><input id="producaoPin" class="pin-input" type="password" autocomplete="off" placeholder="PIN"></div>
+      <div class="production-form-grid">
+        <div class="filter"><label class="small">Data</label><input id="productionDate" type="date"></div>
+        <div class="filter"><label class="small">Traço / tipo de concreto</label><input id="mixName" list="mixOptions" placeholder="Pavimento Rígido"><datalist id="mixOptions"></datalist></div>
+        <div class="filter"><label class="small">Produção (m³)</label><input id="volumeM3" type="number" min="0" step="0.001"></div>
+        <div class="filter"><label class="small">Quantidade de caminhões</label><input id="trucksCount" type="number" min="0" step="1"></div>
+        <div class="filter"><label class="small">Cargas / viagens</label><input id="loadsCount" type="number" min="0" step="1"></div>
+      </div>
+      <div class="filter" style="margin-top:10px"><label class="small">Observação</label><textarea id="productionNote" placeholder="Opcional"></textarea></div>
+      <div class="editor-actions"><button id="saveProduction" class="primary">Salvar produção</button><button id="cancelProductionEdit" class="hidden">Cancelar edição</button></div>
+      <div class="small" style="margin-top:10px">As horas rodadas são associadas automaticamente ao Horímetro Oficial da Usina no dia. Pavimento Rígido é o traço principal, mas novos traços podem ser digitados e ficam disponíveis para os próximos lançamentos.</div>
+    </article>
 
     <h2 class="section-title">Lançamentos</h2>
     <section class="card table-card">
-      <table><thead><tr><th>Data</th><th>Traço</th><th>Produção</th><th>Caminhões</th><th>Cargas</th><th>Horas rodadas</th><th>Ações</th></tr></thead><tbody id="productionBody"></tbody></table>
+      <table><thead><tr><th>Data</th><th>Traço</th><th>Produção</th><th>Caminhões</th><th>Cargas</th><th>Horas produzindo</th><th>m³/h (dia)</th><th>Ações</th></tr></thead><tbody id="productionBody"></tbody></table>
     </section>
+  </section>
+
+  <section id="tab-targets" class="tab-page">
+    <article class="card">
+      <h3 style="margin:0 0 6px;font-size:16px;font-weight:700">Metas de disponibilidade e eficiência</h3>
+      <p class="muted" style="margin:0 0 16px;max-width:70ch">As metas viram um selo nos indicadores e uma linha de referência nos gráficos da aba Gestão. Deixe um campo em branco para remover a meta.</p>
+      <div class="filter" style="margin-bottom:14px;max-width:190px"><label class="small" for="metaPin">PIN da gestão</label><input id="metaPin" class="pin-input" type="password" autocomplete="off" placeholder="PIN"></div>
+      <div class="targets-grid">
+        <div class="filter"><label class="small" for="targetAvail">Meta de disponibilidade (%)</label><input id="targetAvail" type="number" inputmode="decimal" min="0" max="100" step="0.1" placeholder="Ex.: 95"></div>
+        <div class="filter"><label class="small" for="targetEff">Meta de eficiência (%)</label><input id="targetEff" type="number" inputmode="decimal" min="0" max="100" step="0.1" placeholder="Ex.: 85"></div>
+      </div>
+      <div class="editor-actions" style="max-width:760px"><button id="saveTargets" class="primary">Salvar metas</button></div>
+      <div id="targetsInfo" class="small" style="margin-top:10px"></div>
+      <div id="metaLoading" class="management-status">Carregando...</div>
+    </article>
+
+    <h2 class="section-title">Como cada motivo é classificado</h2>
+    <div class="small" style="margin:-4px 0 12px">É a regra usada nos indicadores da aba Gestão. Ao corrigir uma parada na linha do tempo, o motivo escolhido define em qual indicador ela entra.</div>
+    <section id="classifGrid" class="classif-grid"></section>
   </section>
 
   <footer class="footer">UC 0012 · dados operacionais preservados na HF-006/Supabase · correções gerenciais auditáveis</footer>

@@ -74,6 +74,7 @@ const PIN_BY_SCOPE = new Map<string, string>([
 const SCOPE_BY_KIND = new Map<string, string>([
   ["save_stop", "gestao"],
   ["save_day", "gestao"],
+  ["save_targets", "gestao"],
   ["save_production", "producao"],
   ["delete_production", "producao"],
 ]);
@@ -218,6 +219,59 @@ function num(value: unknown, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+// O PostgREST devolve no maximo 1000 linhas por requisicao.
+// Em periodos longos (um ano) pagina ate acabar, para nao perder eventos.
+async function fetchAll(build: (from: number, to: number) => PromiseLike<{ data: any[] | null; error: any }>) {
+  const PAGE = 1000;
+  const out: any[] = [];
+  for (let page = 0; page < 100; page++) {
+    const { data, error } = await build(page * PAGE, page * PAGE + PAGE - 1);
+    if (error) return { data: null as any[] | null, error };
+    out.push(...(data ?? []));
+    if (!data || data.length < PAGE) break;
+  }
+  return { data: out as any[] | null, error: null };
+}
+
+// Categoria de uma parada para os indicadores:
+//  unavailability = fator mecanico/eletrico da usina (reduz a Disponibilidade)
+//  efficiency     = fator externo (reduz a Eficiencia, nao a Disponibilidade)
+//  unclassified   = parada sem motivo; conta como perda de eficiencia ate ser classificada
+//  excluded       = fora da jornada (refeicao, sem operacao)
+type Category = "unavailability" | "efficiency" | "unclassified" | "excluded";
+function segCategory(reason: any): Category {
+  if (!reason || reason.reason_code === "UNCLASSIFIED" || reason.category === "unclassified") return "unclassified";
+  if (reason.affects_availability === false) return "excluded";
+  return reason.category === "unavailability" ? "unavailability" : "efficiency";
+}
+
+const clampPct = (v: number) => Math.max(0, Math.min(100, v));
+
+// Disponibilidade = (jornada - indisponibilidade) / jornada
+// Eficiencia      = produzindo / (jornada - indisponibilidade)
+// Utilizacao      = produzindo / jornada
+function kpiFrom(journey: number, running: number, unavail: number, loss: number, unclassified: number, excluded: number) {
+  const base = journey - unavail;
+  return {
+    journey_seconds: journey,
+    running_seconds: running,
+    unavailability_seconds: unavail,
+    efficiency_loss_seconds: loss,
+    unclassified_seconds: unclassified,
+    excluded_seconds: excluded,
+    availability_percent: journey > 0 ? clampPct(base / journey * 100) : null,
+    efficiency_percent: base > 0 ? clampPct(running / base * 100) : null,
+    utilization_percent: journey > 0 ? clampPct(running / journey * 100) : null
+  };
+}
+
+function bucketKey(date: string, gran: string) {
+  if (gran === "day") return date;
+  if (gran === "month") return date.slice(0, 7);
+  const wd = new Date(dayStartMs(date)).getUTCDay(); // 0 = domingo; 03:00Z cai no mesmo dia local
+  return addDays(date, -(wd === 0 ? 6 : wd - 1)); // segunda-feira da semana
+}
+
 async function audit(action: string, operationDate: string | null, entityType: string, entityId: string | null, beforeData: unknown, afterData: unknown) {
   const { error } = await supabase.from("plant_management_audit").insert({
     device_id: DEVICE_ID,
@@ -231,7 +285,7 @@ async function audit(action: string, operationDate: string | null, entityType: s
   if (error) console.error("audit:", error);
 }
 
-async function overview(startDate: string, endDate: string) {
+async function overview(startDate: string, endDate: string, compact = false) {
   const firstMs = dayStartMs(startDate);
   const lastMs = dayStartMs(addDays(endDate, 1));
   const queryEnd = new Date(lastMs + 86400000).toISOString();
@@ -246,8 +300,8 @@ async function overview(startDate: string, endDate: string) {
   const officialStart = cfg?.official_started_at ? Date.parse(cfg.official_started_at) : firstMs;
   const queryStart = new Date(Math.min(firstMs - 86400000, officialStart - 86400000)).toISOString();
 
-  const [eventsReq, stateReq, reasonsReq, dayReq, stopReq, prodReq, mixReq] = await Promise.all([
-    supabase.from("equipment_events")
+  const [eventsReq, stateReq, reasonsReq, dayReq, stopReq, prodReq, mixReq, targetsReq] = await Promise.all([
+    fetchAll((from, to) => supabase.from("equipment_events")
       .select("event_type,motor_id,event_time,received_at,duration_seconds")
       .eq("device_id", DEVICE_ID)
       .eq("simulation", false)
@@ -255,28 +309,33 @@ async function overview(startDate: string, endDate: string) {
       .eq("event_type", "DESLIGOU")
       .gte("received_at", queryStart)
       .lte("received_at", queryEnd)
-      .order("received_at", { ascending: true }),
+      .order("received_at", { ascending: true }).order("id", { ascending: true })
+      .range(from, to)),
     supabase.from("equipment_state")
       .select("motor_id,name,running,hourmeter_seconds,current_run_seconds,current_stop_seconds,starts_total,stops_total,last_seen")
       .eq("device_id", DEVICE_ID).in("motor_id", [0,1,2]).order("motor_id"),
     supabase.from("plant_management_reason_catalog")
-      .select("reason_code,label,display_order,affects_availability,is_meal,color_hex")
+      .select("reason_code,label,display_order,affects_availability,is_meal,color_hex,category")
       .eq("enabled", true).order("display_order"),
-    supabase.from("plant_day_overrides")
+    fetchAll((from, to) => supabase.from("plant_day_overrides")
       .select("operation_date,start_at,end_at,note")
-      .eq("device_id", DEVICE_ID).gte("operation_date", startDate).lte("operation_date", endDate),
-    supabase.from("plant_stop_overrides")
+      .eq("device_id", DEVICE_ID).gte("operation_date", startDate).lte("operation_date", endDate)
+      .order("operation_date").range(from, to)),
+    fetchAll((from, to) => supabase.from("plant_stop_overrides")
       .select("id,operation_date,segment_key,original_start_at,original_end_at,adjusted_start_at,adjusted_end_at,reason_code,note,updated_at")
-      .eq("device_id", DEVICE_ID).gte("operation_date", startDate).lte("operation_date", endDate),
-    supabase.from("plant_production_records")
+      .eq("device_id", DEVICE_ID).gte("operation_date", startDate).lte("operation_date", endDate)
+      .order("id").range(from, to)),
+    fetchAll((from, to) => supabase.from("plant_production_records")
       .select("id,operation_date,mix_name,volume_m3,trucks_count,loads_count,note,updated_at")
       .eq("device_id", DEVICE_ID).gte("operation_date", startDate).lte("operation_date", endDate)
-      .order("operation_date").order("id"),
+      .order("operation_date").order("id").range(from, to)),
     supabase.from("plant_mix_catalog")
-      .select("id,mix_name,is_primary,display_order").eq("enabled", true).order("display_order")
+      .select("id,mix_name,is_primary,display_order").eq("enabled", true).order("display_order"),
+    supabase.from("plant_targets")
+      .select("metric,target_percent,updated_at").eq("device_id", DEVICE_ID)
   ]);
 
-  const errors = [eventsReq.error, stateReq.error, reasonsReq.error, dayReq.error, stopReq.error, prodReq.error, mixReq.error].filter(Boolean);
+  const errors = [eventsReq.error, stateReq.error, reasonsReq.error, dayReq.error, stopReq.error, prodReq.error, mixReq.error, targetsReq.error].filter(Boolean);
   if (errors.length) throw errors[0];
   const officialOffset = num(cfg?.initial_offset_seconds);
   const officialDate = dateKey(officialStart);
@@ -398,6 +457,7 @@ async function overview(startDate: string, endDate: string) {
         duration_seconds: Math.max(0,(adjEnd-adjStart)/1000),
         reason_code: reasonCode,
         reason_label: reason?.label ?? "Não classificada",
+        category: segCategory(reason),
         affects_availability: reason?.affects_availability !== false,
         is_meal: reason?.is_meal === true,
         source: ov ? "MANUAL" : (i === mealIdx ? "AUTO_MEAL" : "AUTO"),
@@ -424,6 +484,17 @@ async function overview(startDate: string, endDate: string) {
       ? Math.max(0,Math.min(100,runningSeconds/scheduledSeconds*100))
       : null;
 
+    // Indicadores novos: separam indisponibilidade (mecanica/eletrica) de perda de eficiencia (externa).
+    // Os campos antigos acima continuam como estavam.
+    const catSec: Record<Category, number> = { unavailability: 0, efficiency: 0, unclassified: 0, excluded: 0 };
+    for (const seg of timeline) {
+      if (seg.type === "STOPPED") catSec[seg.category as Category] += num(seg.duration_seconds);
+    }
+    const dayUnavail = Math.min(catSec.unavailability, downtimeSeconds);
+    const dayLoss = Math.max(0, downtimeSeconds - dayUnavail);
+    const dayUnclassified = Math.min(catSec.unclassified, dayLoss);
+    const dayKpi = kpiFrom(scheduledSeconds, runningSeconds, dayUnavail, dayLoss, dayUnclassified, excludedAvailabilitySeconds);
+
     days.push({
       date, has_activity: true,
       detected_start_at: new Date(start).toISOString(),
@@ -437,6 +508,7 @@ async function overview(startDate: string, endDate: string) {
       meal_seconds: mealSeconds,
       excluded_availability_seconds: excludedAvailabilitySeconds,
       availability_percent: availability,
+      kpi: dayKpi,
       timeline,
       production: (prodReq.data ?? []).filter((p:any)=>p.operation_date===date)
     });
@@ -459,6 +531,67 @@ async function overview(startDate: string, endDate: string) {
     }
   }
   const pareto = Array.from(paretoMap.values()).sort((a,b)=>b.seconds-a.seconds);
+
+  // ---- Indicadores do periodo: disponibilidade x eficiencia e os motivos de cada uma ----
+  const activeDays = days.filter((d:any) => d.kpi);
+  const sumKpi = (list: any[], f: string) => list.reduce((s, d) => s + num(d.kpi?.[f]), 0);
+  const kpi = kpiFrom(
+    sumKpi(activeDays, "journey_seconds"), sumKpi(activeDays, "running_seconds"),
+    sumKpi(activeDays, "unavailability_seconds"), sumKpi(activeDays, "efficiency_loss_seconds"),
+    sumKpi(activeDays, "unclassified_seconds"), sumKpi(activeDays, "excluded_seconds")
+  );
+
+  type Row = { reason_code: string; label: string; seconds: number; count: number; color_hex: string };
+  const catRows: Record<Category, Map<string, Row>> = {
+    unavailability: new Map(), efficiency: new Map(), unclassified: new Map(), excluded: new Map()
+  };
+  for (const d of activeDays) {
+    for (const seg of d.timeline) {
+      if (seg.type !== "STOPPED") continue;
+      const m = catRows[seg.category as Category];
+      const key = seg.reason_code ?? "UNCLASSIFIED";
+      const cur = m.get(key) ?? { reason_code: key, label: seg.reason_label, seconds: 0, count: 0, color_hex: seg.color_hex };
+      cur.seconds += num(seg.duration_seconds);
+      cur.count += 1;
+      m.set(key, cur);
+    }
+  }
+  const rowsOf = (cats: Category[], base: number) => {
+    const rows: any[] = [];
+    for (const c of cats) for (const r of catRows[c].values()) rows.push({ ...r, category: c, unclassified: c === "unclassified" });
+    rows.sort((a, b) => b.seconds - a.seconds);
+    const total = rows.reduce((s, r) => s + r.seconds, 0);
+    return rows.map(r => ({
+      ...r,
+      pct_of_category: total > 0 ? r.seconds / total * 100 : null,
+      pct_of_journey: base > 0 ? r.seconds / base * 100 : null
+    }));
+  };
+  const breakdown = {
+    unavailability: rowsOf(["unavailability"], kpi.journey_seconds),
+    efficiency: rowsOf(["efficiency", "unclassified"], kpi.journey_seconds),
+    excluded: rowsOf(["excluded"], 0).map(r => ({ ...r, pct_of_journey: null }))
+  };
+
+  // ---- Evolucao do periodo (por dia, semana ou mes, conforme o tamanho do periodo) ----
+  const granularity = dates.length <= 31 ? "day" : dates.length <= 140 ? "week" : "month";
+  const buckets = new Map<string, any[]>();
+  for (const d of activeDays) {
+    const k = bucketKey(d.date, granularity);
+    if (!buckets.has(k)) buckets.set(k, []);
+    buckets.get(k)!.push(d);
+  }
+  const trend = Array.from(buckets.entries()).sort((a, b) => a[0].localeCompare(b[0])).map(([key, list]) => ({
+    key,
+    from_date: list[0].date,
+    to_date: list[list.length - 1].date,
+    days_count: list.length,
+    ...kpiFrom(
+      sumKpi(list, "journey_seconds"), sumKpi(list, "running_seconds"),
+      sumKpi(list, "unavailability_seconds"), sumKpi(list, "efficiency_loss_seconds"),
+      sumKpi(list, "unclassified_seconds"), sumKpi(list, "excluded_seconds")
+    )
+  }));
 
   const componentStats: any[] = [];
   for (const id of [0,1,2]) {
@@ -501,6 +634,61 @@ async function overview(startDate: string, endDate: string) {
   const trucksTotal = Array.from(trucksByDay.values()).reduce((s,n)=>s+n,0);
   const loadsTotal = production.reduce((s:any,p:any)=>s+num(p.loads_count),0);
 
+  // ---- Producao por hora: uma taxa por dia; o periodo e a media das taxas diarias ----
+  // Taxa principal = m3 por hora produzindo (ritmo da usina). Tambem informa m3 por hora de jornada.
+  const volumeByDate = new Map<string, number>();
+  for (const p of production) {
+    const d = String(p.operation_date);
+    volumeByDate.set(d, (volumeByDate.get(d) ?? 0) + num(p.volume_m3));
+  }
+  const productionDaily = days.filter((d:any) => !d.before_official_start).map((d:any) => {
+    const vol = volumeByDate.has(d.date) ? volumeByDate.get(d.date)! : null;
+    const runH = num(d.running_seconds) / 3600;
+    const jorH = num(d.scheduled_seconds) / 3600;
+    return {
+      date: d.date,
+      is_today: d.date === today,
+      has_activity: d.has_activity === true,
+      volume_m3: vol,
+      running_seconds: num(d.running_seconds),
+      journey_seconds: num(d.scheduled_seconds),
+      m3_per_running_hour: vol !== null && vol > 0 && runH > 0 ? vol / runH : null,
+      m3_per_journey_hour: vol !== null && vol > 0 && jorH > 0 ? vol / jorH : null
+    };
+  });
+  const rated = productionDaily.filter((x:any) => x.m3_per_running_hour !== null);
+  const mean = (list: any[], f: string) => list.length ? list.reduce((s, x) => s + x[f], 0) / list.length : null;
+  const monthMap = new Map<string, any[]>();
+  for (const x of rated) {
+    const k = x.date.slice(0, 7);
+    if (!monthMap.has(k)) monthMap.set(k, []);
+    monthMap.get(k)!.push(x);
+  }
+  const byRate = [...rated].sort((a:any, b:any) => a.m3_per_running_hour - b.m3_per_running_hour);
+  const productionHourly = {
+    basis: "m3_per_running_hour",
+    days_counted: rated.length,
+    avg_m3_per_running_hour: mean(rated, "m3_per_running_hour"),
+    avg_m3_per_journey_hour: mean(rated.filter((x:any) => x.m3_per_journey_hour !== null), "m3_per_journey_hour"),
+    best_day: byRate.length ? { date: byRate[byRate.length - 1].date, value: byRate[byRate.length - 1].m3_per_running_hour } : null,
+    worst_day: byRate.length ? { date: byRate[0].date, value: byRate[0].m3_per_running_hour } : null,
+    months: Array.from(monthMap.entries()).sort((a, b) => a[0].localeCompare(b[0])).map(([month, list]) => ({
+      month,
+      days_counted: list.length,
+      total_m3: list.reduce((s, x) => s + x.volume_m3, 0),
+      avg_m3_per_running_hour: mean(list, "m3_per_running_hour"),
+      avg_m3_per_journey_hour: mean(list.filter((x:any) => x.m3_per_journey_hour !== null), "m3_per_journey_hour")
+    }))
+  };
+
+  const targets = { availability_percent: null as number | null, efficiency_percent: null as number | null, updated_at: null as string | null };
+  for (const t of targetsReq.data ?? []) {
+    const v = Number(t.target_percent);
+    if (t.metric === "availability") targets.availability_percent = v;
+    if (t.metric === "efficiency") targets.efficiency_percent = v;
+    if (!targets.updated_at || String(t.updated_at) > targets.updated_at) targets.updated_at = String(t.updated_at);
+  }
+
   return {
     ok:true,
     kind:"overview",
@@ -514,9 +702,14 @@ async function overview(startDate: string, endDate: string) {
       downtime_seconds:totalDowntime,
       availability_percent:availability
     },
+    kpi,
+    breakdown,
+    trend: { granularity, buckets: trend },
+    targets,
     reasons,
     mix_catalog:mixReq.data ?? [],
-    days,
+    // compact = true omite a linha do tempo de cada dia (periodos longos pesam MB) e mantem todos os indicadores.
+    days: compact ? days.map(({ timeline: _t, ...d }: any) => d) : days,
     pareto,
     components:componentStats,
     production,
@@ -525,7 +718,9 @@ async function overview(startDate: string, endDate: string) {
       trucks_count:trucksTotal,
       loads_count:loadsTotal,
       m3_per_running_hour: totalRunning>0 ? productionTotal/(totalRunning/3600) : null
-    }
+    },
+    production_daily: productionDaily,
+    production_hourly: productionHourly
   };
 }
 
@@ -547,7 +742,7 @@ Deno.serve(async (req: Request) => {
       const end = typeof body.end === "string" ? body.end : "";
       if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end) || start > end)
         return json(req,{ok:false,error:"Periodo invalido"},400);
-      return json(req, await overview(start,end));
+      return json(req, await overview(start,end,body.compact === true));
     }
 
     const scope = SCOPE_BY_KIND.get(String(body.kind ?? ""));
@@ -617,6 +812,42 @@ Deno.serve(async (req: Request) => {
       if (error) throw error;
       await audit("SAVE_DAY",date,"day_override",date,before,saved);
       return json(req,{ok:true,kind:"day_saved",record:saved});
+    }
+
+    if (body.kind === "save_targets") {
+      // Campo ausente = nao mexe. Vazio/null = apaga a meta. Numero 0..100 = grava.
+      const metrics: Array<[string, unknown]> = [
+        ["availability", body.availability_percent],
+        ["efficiency", body.efficiency_percent]
+      ];
+      const parsed: Array<[string, number | null]> = [];
+      for (const [metric, raw] of metrics) {
+        if (raw === undefined) continue;
+        if (raw === null || raw === "") { parsed.push([metric, null]); continue; }
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n < 0 || n > 100)
+          return json(req,{ok:false,error:"Meta invalida: use um valor de 0 a 100"},400);
+        parsed.push([metric, Math.round(n * 100) / 100]);
+      }
+      if (!parsed.length) return json(req,{ok:false,error:"Nenhuma meta informada"},400);
+
+      const { data:before } = await supabase.from("plant_targets")
+        .select("metric,target_percent").eq("device_id",DEVICE_ID);
+      for (const [metric, value] of parsed) {
+        const r = value === null
+          ? await supabase.from("plant_targets").delete().eq("device_id",DEVICE_ID).eq("metric",metric)
+          : await supabase.from("plant_targets").upsert(
+              { device_id:DEVICE_ID, metric, target_percent:value, updated_at:new Date().toISOString() },
+              { onConflict:"device_id,metric" });
+        if (r.error) throw r.error;
+      }
+      const { data:after,error:afterErr } = await supabase.from("plant_targets")
+        .select("metric,target_percent,updated_at").eq("device_id",DEVICE_ID);
+      if (afterErr) throw afterErr;
+      await audit("SAVE_TARGETS",null,"targets",DEVICE_ID,before,after);
+      const out: Record<string, number | null> = { availability_percent:null, efficiency_percent:null };
+      for (const t of after ?? []) out[t.metric === "availability" ? "availability_percent" : "efficiency_percent"] = Number(t.target_percent);
+      return json(req,{ok:true,kind:"targets_saved",targets:out});
     }
 
     if (body.kind === "save_production") {
