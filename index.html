@@ -274,11 +274,15 @@
       return h+'</div>';
     }
 
-    function reasonList(rows){
+    // Motivos de indisponibilidade que são programados (o restante são quebras e falhas).
+    const PLANNED_CODES = new Set(["PREVENTIVE","CLEANING","CALIBRATION"]);
+
+    function reasonList(rows,planned){
       if(!rows.length) return '<div class="empty-note">Nenhuma parada deste tipo no período.</div>';
       const max=Math.max.apply(null,rows.map(function(r){return r.seconds;}))||1;
       return '<div class="reason-list">'+rows.map(function(r){
-        return '<div class="reason-row'+(r.unclassified?' unclassified':'')+'"><span class="reason-name">'+(r.unclassified?'⚠ ':'')+esc(r.label)+'</span>'+
+        const tag=(planned && planned.has(r.reason_code))?' <small class="reason-tag">programada</small>':'';
+        return '<div class="reason-row'+(r.unclassified?' unclassified':'')+'"><span class="reason-name">'+(r.unclassified?'⚠ ':'')+esc(r.label)+tag+'</span>'+
           '<span class="reason-track"><span class="reason-bar" style="width:'+(r.seconds/max*100).toFixed(1)+'%"></span></span>'+
           '<span class="reason-val"><b>'+fmtShort(r.seconds)+'</b> <small>· '+esc(fmtPct(r.pct_of_category))+'</small></span></div>';
       }).join("")+'</div>';
@@ -301,7 +305,12 @@
       if(!has) return h+'<div class="empty-note" style="margin-top:14px">Sem jornada registrada no período, então este indicador não pode ser calculado.</div></article>';
       h+='<div class="ind-figure"><strong>'+esc(fmtPct(o.value))+'</strong>'+targetChip(o.value,o.target)+'</div>'+meter(o.value,o.target);
       h+='<div class="ind-sub muted">'+esc(o.lostLabel)+': <b>'+fmtShort(o.lostSeconds)+'</b> · '+esc(fmtPct(o.lostPct))+' '+esc(o.lostBase)+'</div>';
-      h+='<h4 class="ind-sub-title">'+esc(o.listTitle)+' · horas e % do total</h4>'+reasonList(o.rows)+reasonTable(o.key,o.rows);
+      if(o.planned && o.rows.length){
+        const plannedSec=o.rows.filter(function(r){return o.planned.has(r.reason_code);}).reduce(function(s,r){return s+r.seconds;},0);
+        const totalSec=o.rows.reduce(function(s,r){return s+r.seconds;},0);
+        h+='<div class="ind-sub muted">Programada: <b>'+fmtShort(plannedSec)+'</b> · Não programada (quebras e falhas): <b>'+fmtShort(totalSec-plannedSec)+'</b></div>';
+      }
+      h+='<h4 class="ind-sub-title">'+esc(o.listTitle)+' · horas e % do total</h4>'+reasonList(o.rows,o.planned)+reasonTable(o.key,o.rows);
       return h+'</article>';
     }
 
@@ -386,7 +395,7 @@
           desc:"Quanto da jornada a usina esteve apta a produzir. Só entram quebras e falhas mecânicas ou elétricas.",
           value:k.availability_percent,target:t.availability_percent,hasBase:J>0,
           lostLabel:"Indisponibilidade",lostSeconds:U,lostPct:J>0?U/J*100:null,lostBase:"da jornada",
-          listTitle:"Motivos da indisponibilidade",rows:b.unavailability||[]})+
+          listTitle:"Motivos da indisponibilidade",rows:b.unavailability||[],planned:PLANNED_CODES})+
         indicatorCard({cls:"eff",key:"eff",title:"Eficiência",
           desc:"Do tempo em que a usina estava disponível, quanto foi realmente produzindo. As perdas vêm de fatores externos.",
           value:k.efficiency_percent,target:t.efficiency_percent,hasBase:(J-U)>0,
@@ -588,7 +597,12 @@
       $("stopEnd").value=toDateTimeLocal(seg.end_at);
       $("stopReason").value=seg.reason_code||"UNCLASSIFIED";
       $("stopNote").value=seg.note||"";
+      syncNotePlaceholder();
       $("stopEditor").scrollIntoView({behavior:"smooth",block:"center"});
+    }
+
+    function syncNotePlaceholder(){
+      $("stopNote").placeholder=$("stopReason").value==="OTHER"?"Obrigatória para o motivo Outros":"Opcional";
     }
 
     function openDayEditor(day){
@@ -618,6 +632,7 @@
       if(!selectedStop) return;
       try{
         requirePin("gestaoPin");
+        if($("stopReason").value==="OTHER" && !$("stopNote").value.trim()) throw new Error("Descreva a parada no campo Observação para usar o motivo Outros.");
         setStatus("Salvando parada...","pending");
         const seg=selectedStop.seg;
         await mgmt({
@@ -847,7 +862,7 @@
       const desc={
         unavailability:"Fator mecânico ou elétrico que impede a usina de funcionar. Reduz a disponibilidade.",
         efficiency:"Fator externo, sem relação com a integridade da usina. Reduz a eficiência.",
-        excluded:"Fora da jornada: não entra em nenhum indicador (ex.: refeição).",
+        excluded:"Rotinas fixas que não entram em nenhum indicador: refeição, DDS e o teste diário de partida. Sem operação só vale para dia ou horário que não estava programado.",
         unclassified:"Parada ainda sem motivo. Conta como perda de eficiência até ser classificada."
       };
       $("classifGrid").innerHTML=REASON_GROUPS.map(function(g){
@@ -984,6 +999,7 @@
       await loadOverview(currentScope());
     });
     $("saveStop").addEventListener("click",saveStop);
+    $("stopReason").addEventListener("change",syncNotePlaceholder);
     $("cancelStop").addEventListener("click",function(){$("stopEditor").classList.add("hidden");selectedStop=null;});
     $("saveDay").addEventListener("click",saveDay);
     $("cancelDay").addEventListener("click",function(){$("dayEditor").classList.add("hidden");});
@@ -1254,6 +1270,7 @@
     .reason-bar{display:block;height:100%;min-width:3px;background:var(--hue);border-radius:0 4px 4px 0}
     .reason-row.unclassified .reason-bar{background:var(--bar-neutral)}
     .reason-row.unclassified .reason-name{color:var(--warn-text)}
+    .reason-tag{margin-left:6px;padding:1px 7px;border-radius:999px;background:var(--surface-3);color:var(--muted);font-size:11px;font-weight:600;white-space:nowrap}
     .reason-val{white-space:nowrap;font-variant-numeric:tabular-nums}
     .reason-val b{font-weight:700;color:var(--text)}
     .reason-val small{color:var(--muted);font-size:12px;font-weight:600}
@@ -1408,7 +1425,7 @@
     <div id="excludedStrip" class="card excluded-strip hidden"></div>
 
     <section class="kpi-grid summary-tiles">
-      <article class="card kpi"><span>Jornada</span><strong id="kpiJourney">--</strong><small>do 1º ao último ciclo, sem refeição</small></article>
+      <article class="card kpi"><span>Jornada</span><strong id="kpiJourney">--</strong><small>do 1º ao último ciclo, sem as paradas fora da jornada</small></article>
       <article class="card kpi"><span>Horas produzindo</span><strong id="kpiRunning">--</strong><small>usina com misturador ligado</small></article>
       <article class="card kpi"><span>Utilização</span><strong id="kpiUtil">N/D</strong><small>produzindo ÷ jornada</small></article>
       <article class="card kpi"><span>Indisponibilidade</span><strong id="kpiUnavail">--</strong><small>falha mecânica ou elétrica</small></article>
@@ -1419,7 +1436,7 @@
     <details class="card how" data-key="how-calc">
       <summary>Como os indicadores são calculados</summary>
       <div class="how-body">
-        <p><b>Jornada:</b> do primeiro ao último ciclo da usina no dia (ou o horário corrigido em “Editar jornada”). Refeição e Sem operação ficam fora da jornada e não entram em nenhum indicador.</p>
+        <p><b>Jornada:</b> do primeiro ao último ciclo da usina no dia (ou o horário corrigido em “Editar jornada”). Refeição, DDS, Setup (teste diário de partida) e Sem operação ficam fora da jornada e não entram em nenhum indicador.</p>
         <p><b>Disponibilidade mecânica</b> = (jornada − indisponibilidade) ÷ jornada. Indisponibilidade é o tempo parado por fator mecânico ou elétrico que impede a usina de funcionar.</p>
         <p><b>Eficiência</b> = horas produzindo ÷ (jornada − indisponibilidade). A perda de eficiência é o tempo em que a usina estava apta, mas parada por fatores externos à sua integridade.</p>
         <p><b>Utilização</b> = horas produzindo ÷ jornada. É o número que antes aparecia como “Disponibilidade” neste painel.</p>
