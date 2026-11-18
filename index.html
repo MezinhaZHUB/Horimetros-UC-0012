@@ -612,43 +612,51 @@
     window.addEventListener("scroll",hideTip,{passive:true});
     document.addEventListener("keydown",function(ev){ if(ev.key==="Escape") hideTip(); });
 
-    // o = { cols:[{value,color,x,label,aria,miss,mark,stack:[{value,color}],tip:{title,rows}}], max, ticks, fmtTick,
-    //       ref:{value}, legend:[{color,label,line,dash,mark,miss,text}], plotH }
-    // miss = coluna abaixo da meta (listrada); mark = traço curto de referência sobre a coluna; ref = linha de meta.
+    // o = { cols:[{value,color,x,label,aria,miss,mark,stack:[{value,color}],bars:[{value,color,miss,label,mark,ghost}],tip:{title,rows}}],
+    //       max, ticks, fmtTick, fmtTick2, ref:{value}, legend:[{color,label,line,dash,mark,miss,ghost,text}], plotH }
+    // miss = coluna abaixo da meta (listrada); mark = traço curto de referência sobre a coluna; ref = linha de meta;
+    // bars = colunas lado a lado no mesmo dia; ghost = contorno tracejado (capacidade) atrás da coluna; fmtTick2 = eixo da direita, na mesma escala.
     function columnChart(host,o){
       hideTip();
       const max=o.max, plotH=o.plotH||200;
       const pos=function(v){ return Math.max(0,Math.min(100,v/max*100)); };
       const isNum=function(v){ return v!==null && v!==undefined && Number.isFinite(v); };
       const yAxis=o.ticks.map(function(t){return '<span style="bottom:'+pos(t)+'%">'+esc(o.fmtTick(t))+'</span>';}).join("");
+      const yAxis2=o.fmtTick2?'<div class="viz-y2">'+o.ticks.map(function(t){return '<span style="bottom:'+pos(t)+'%">'+esc(o.fmtTick2(t))+'</span>';}).join("")+'</div>':"";
       const grid=o.ticks.filter(function(t){return t>0;}).map(function(t){return '<i class="viz-grid" style="bottom:'+pos(t)+'%"></i>';}).join("");
       const n=o.cols.length;
-      const cols=o.cols.map(function(c,i){
-        const has=isNum(c.value);
-        const h=has?pos(c.value):0;
+      const barHtml=function(b,grouped){
+        const has=isNum(b.value);
+        const h=has?pos(b.value):0;
         let bar;
-        if(has && c.stack){
-          bar='<span class="viz-bar stack" style="height:'+h+'%">'+c.stack.map(function(s){
-            const f=c.value>0?s.value/c.value*100:0;
+        if(has && b.stack){
+          bar='<span class="viz-bar stack" style="height:'+h+'%">'+b.stack.map(function(s){
+            const f=b.value>0?s.value/b.value*100:0;
             return f>0?'<i class="viz-seg" style="height:'+f+'%;background-color:'+s.color+'"></i>':'';
           }).join("")+'</span>';
         }else{
-          bar='<span class="viz-bar'+(c.miss?' miss':'')+'" style="height:'+h+'%;background-color:'+(has?c.color:"var(--border-strong)")+'"></span>';
+          bar='<span class="viz-bar'+(b.miss?' miss':'')+'" style="height:'+h+'%;background-color:'+(has?b.color:"var(--border-strong)")+'"></span>';
         }
-        return '<div class="viz-col" tabindex="0" data-i="'+i+'" role="img" aria-label="'+esc(c.aria||"")+'">'+bar+
-          (isNum(c.mark)?'<i class="viz-mark" style="bottom:'+pos(c.mark)+'%"></i>':'')+
-          (c.label && has?'<span class="viz-val" style="bottom:calc('+h+'% + 4px)">'+esc(c.label)+'</span>':'')+
-          '</div>';
+        const extra=(isNum(b.ghost)?'<i class="viz-ghost" style="height:'+pos(b.ghost)+'%"></i>':'')+
+          (isNum(b.mark)?'<i class="viz-mark" style="bottom:'+pos(b.mark)+'%"></i>':'')+
+          (b.label && has?'<span class="viz-val" style="bottom:calc('+h+'% + 4px)">'+esc(b.label)+'</span>':'');
+        return grouped?'<span class="viz-b">'+extra+bar+'</span>':bar+extra;
+      };
+      const cols=o.cols.map(function(c,i){
+        const inner=c.bars
+          ?'<span class="viz-grp">'+c.bars.map(function(b){return barHtml(b,true);}).join("")+'</span>'
+          :barHtml(c,false);
+        return '<div class="viz-col" tabindex="0" data-i="'+i+'" role="img" aria-label="'+esc(c.aria||"")+'">'+inner+'</div>';
       }).join("");
       const step=n>24?3:(n>14?2:1);
       const xAxis=o.cols.map(function(c,i){return '<span>'+(i%step===0?esc(c.x):"")+'</span>';}).join("");
       const ref=o.ref&&isNum(o.ref.value)?'<div class="viz-ref" style="bottom:'+pos(o.ref.value)+'%"></div>':"";
       const legend=(o.legend&&o.legend.length)?'<div class="viz-legend">'+o.legend.map(function(l){
         if(l.text) return '<span class="txt">'+esc(l.text)+'</span>';
-        return '<span><i class="'+(l.line?'line':'')+(l.dash?' dash':'')+(l.mark?' mark':'')+(l.miss?' miss':'')+'"'+(l.color?' style="background-color:'+l.color+'"':'')+'></i>'+esc(l.label)+'</span>';
+        return '<span><i class="'+(l.line?'line':'')+(l.dash?' dash':'')+(l.mark?' mark':'')+(l.miss?' miss':'')+(l.ghost?' ghost':'')+'"'+(l.color?' style="background-color:'+l.color+'"':'')+'></i>'+esc(l.label)+'</span>';
       }).join("")+'</div>':"";
-      host.innerHTML=legend+'<div class="viz" style="--plot-h:'+plotH+'px"><div class="viz-y">'+yAxis+'</div>'+
-        '<div class="viz-plot">'+grid+'<div class="viz-cols">'+cols+'</div>'+ref+'</div><div class="viz-x">'+xAxis+'</div></div>';
+      host.innerHTML=legend+'<div class="viz'+(o.fmtTick2?' has-y2':'')+'" style="--plot-h:'+plotH+'px"><div class="viz-y">'+yAxis+'</div>'+
+        '<div class="viz-plot">'+grid+'<div class="viz-cols">'+cols+'</div>'+ref+'</div>'+yAxis2+'<div class="viz-x">'+xAxis+'</div></div>';
       host._tips=o.cols.map(function(c){return c.tip;});
       bindTips(host);
     }
@@ -829,15 +837,37 @@
       $("capGrid").innerHTML=left+right;
     }
 
+    // Ritmo (m³/h) de um conjunto de dias, com a capacidade dos misturadores que realmente rodaram.
+    // capacidade = Σ(capacidade de cada misturador × horas que ele rodou) ÷ horas com a usina produzindo:
+    // 100 m³/h com um misturador, 200 m³/h com os dois juntos o tempo todo (manual).
+    function rateInfo(days,mixers){
+      const capOf=new Map(mixers.map(function(m){return [m.motor_id,m.capacity_m3h];}));
+      let union=0, overlap=0, capSec=0;
+      const ran=new Map();
+      days.forEach(function(d){
+        const run=(d.lines||[]).reduce(function(s,l){return s+(l.running_seconds||0);},0);
+        const u=d.running_seconds||0;
+        union+=u; overlap+=Math.max(0,run-u);
+        (d.lines||[]).forEach(function(l){
+          capSec+=(capOf.get(l.motor_id)||0)*(l.running_seconds||0);
+          if(l.running_seconds>0) ran.set(l.motor_id,(ran.get(l.motor_id)||0)+l.running_seconds);
+        });
+      });
+      return {union:union,bothFrac:union>0?overlap/union:null,capacity:union>0?capSec/union:null,ran:ran};
+    }
+
     function renderCapacityChart(data){
       const tr=data.trend||{}, buckets=tr.buckets||[], gran=tr.granularity||"day", t=data.targets||{};
       const sec=$("capTrendSection");
-      if(buckets.length<2){ sec.classList.add("hidden"); $("capChart").innerHTML=""; $("capTable").innerHTML=""; return; }
+      if(buckets.length<2){ sec.classList.add("hidden"); $("capChart").innerHTML=""; $("capTable").innerHTML=""; $("capRates").innerHTML=""; return; }
       sec.classList.remove("hidden");
+      const cap=data.capacity||{}, mixers=cap.mixers||[], nominal=cap.nominal_m3h||200;
+      const nameOf=new Map(mixers.map(function(m){return [m.motor_id,m.name.replace("Misturador ","")];}));
       const unit=gran==="day"?"dia":(gran==="week"?"semana":"mês");
       const unitPlural=gran==="day"?"dias":(gran==="week"?"semanas":"meses");
-      $("capChartTitle").textContent="Disponibilidade por capacidade, por "+unit;
-      $("capChartSub").textContent="A coluna é a disponibilidade por capacidade; o traço é a disponibilidade mecânica da aba Gestão. A distância entre os dois é o efeito do misturador fora de serviço.";
+      $("capChartTitle").textContent="Capacidade disponível e produção, por "+unit;
+      $("capChartSub").textContent="As duas colunas usam a mesma escala: o eixo da esquerda é a % da capacidade nominal e o da direita, os m³/h ("+fmtNum(nominal,0)+" m³/h = 100%). "+
+        "Laranja: disponibilidade por capacidade. Azul: ritmo de produção (m³ por hora com a usina produzindo). O contorno tracejado é a capacidade pelo manual dos misturadores que rodaram, ponderada pelo tempo de cada um: 100 m³/h com um, 200 m³/h com os dois o tempo todo.";
       const n=buckets.length;
       const xLabel=function(b){ return gran==="month"?fmtMonth(b.key):((gran==="day"&&n>12)?b.key.slice(8,10):fmtDay(b.key)); };
       const tipTitle=function(b){
@@ -845,40 +875,95 @@
         return (gran==="week"?"Semana de "+fmtDay(b.key):fmtMonth(b.key))+" · "+plural(b.days_count,"dia","dias")+" de operação";
       };
       const isNum=function(v){ return v!==null && v!==undefined && Number.isFinite(v); };
+      const keyOf=function(date){ return gran==="day"?date:(gran==="month"?date.slice(0,7):mondayOf(date)); };
+      const rated=(data.production_daily||[]).filter(function(d){return d.m3_per_running_hour!=null;});
+      const infoOf=new Map(buckets.map(function(b){
+        return [b.key,rateInfo(rated.filter(function(d){return keyOf(d.date)===b.key;}),mixers)];
+      }));
       const vals=buckets.map(function(b){return b.capacity_availability_percent;});
-      const show=pickLabels(vals,12);
+      const rates=buckets.map(function(b){return isNum(b.m3_per_running_hour)?b.m3_per_running_hour:null;});
+      const showA=pickLabels(vals,12), showP=pickLabels(rates,12);
       const hasT=t.availability_percent!==null && t.availability_percent!==undefined;
       const target=t.availability_percent;
       const counted=vals.filter(isNum).length;
       const below=hasT?vals.filter(function(v){return isNum(v) && v<target;}).length:0;
-      const color="var(--series-2)";
+      const colA="var(--series-2)", colP="var(--series-1)";
+      const pct=function(m3h){ return m3h/nominal*100; };
+      const maxPct=Math.max(100,Math.ceil(Math.max.apply(null,rates.filter(isNum).map(pct).concat([0]))*1.05/25)*25);
+      const ticks=[]; for(let v=0;v<=maxPct;v+=25) ticks.push(v);
+      const ranText=function(info){
+        const names=Array.from(info.ran.keys()).sort().map(function(id){return nameOf.get(id)||id;});
+        if(!names.length) return "nenhum";
+        if(names.length===1) return "só o "+names[0];
+        return names.join(" e ")+" ("+fmtNum((info.bothFrac||0)*100,0)+"% do tempo juntos)";
+      };
       columnChart($("capChart"),{
-        max:100,ticks:[0,25,50,75,100],fmtTick:function(v){return v+"%";},
+        max:maxPct,ticks:ticks,fmtTick:function(v){return v+"%";},fmtTick2:function(v){return fmtNum(v/100*nominal,0);},plotH:240,
         cols:buckets.map(function(b,i){
-          const v=b.capacity_availability_percent;
+          const v=b.capacity_availability_percent, r=rates[i], info=infoOf.get(b.key);
           const miss=hasT && isNum(v) && v<target;
-          const rows=[{color:color,label:"Disponibilidade por capacidade",value:fmtPct(v)},
+          const rows=[{color:colA,label:"Disponibilidade por capacidade",value:fmtPct(v)},
             {label:"Disponibilidade mecânica (Gestão)",value:fmtPct(b.availability_percent)},
-            {label:"Capacidade em serviço",value:fmtPct(b.capacity_in_service_percent)},
-            {label:"Capacidade média",value:isNum(b.capacity_m3h)?fmtNum(b.capacity_m3h,0)+" m³/h":"N/D"}];
+            {label:"Capacidade em serviço",value:fmtPct(b.capacity_in_service_percent)}];
           if(hasT && isNum(v)){
-            rows.push({label:"Meta",value:fmtPct(target)});
+            rows.push({label:"Meta de disponibilidade",value:fmtPct(target)});
             rows.push({label:miss?"Abaixo da meta":"Dentro da meta",value:fmtPp(v-target)});
           }
-          return {value:v,color:color,miss:miss,mark:b.availability_percent,x:xLabel(b),label:show.has(i)?fmtPct0(v):null,
-            aria:tipTitle(b)+": "+fmtPct(v)+(miss?" (abaixo da meta)":""),tip:{title:tipTitle(b),rows:rows}};
+          if(r!==null){
+            rows.push({color:colP,label:"Ritmo de produção",value:fmtNum(r,1)+" m³/h"});
+            rows.push({label:"Misturadores rodando",value:ranText(info)});
+            if(isNum(info.capacity) && info.capacity>0){
+              rows.push({label:"Capacidade pelo manual",value:fmtNum(info.capacity,0)+" m³/h"});
+              rows.push({label:"Ritmo ÷ capacidade",value:fmtNum(r/info.capacity*100,0)+"%"});
+            }
+          }else{
+            rows.push({color:colP,label:"Ritmo de produção",value:"sem produção lançada"});
+          }
+          return {x:xLabel(b),
+            bars:[{value:v,color:colA,miss:miss,mark:b.availability_percent,label:showA.has(i)?fmtPct0(v):null},
+                  {value:r===null?null:pct(r),color:colP,label:r!==null&&showP.has(i)?fmtNum(r,0):null,ghost:r!==null&&isNum(info.capacity)?pct(info.capacity):null}],
+            aria:tipTitle(b)+": disponibilidade por capacidade "+fmtPct(v)+(miss?" (abaixo da meta)":"")+(r!==null?"; ritmo "+fmtNum(r,1)+" m³/h":""),
+            tip:{title:tipTitle(b),rows:rows}};
         }),
         ref:hasT?{value:target}:null,
-        legend:[{color:color,label:"Disponibilidade por capacidade"}].concat(hasT?[{color:color,miss:true,label:"Abaixo da meta"}]:[]).concat([
-          {mark:true,label:"Disponibilidade mecânica (Gestão)"}]).concat(hasT?[{line:true,label:"Meta "+fmtPct(target)},
+        legend:[{color:colA,label:"Disponibilidade por capacidade"}].concat(hasT?[{color:colA,miss:true,label:"Abaixo da meta"}]:[]).concat([
+          {mark:true,label:"Disponibilidade mecânica (Gestão)"},{color:colP,label:"Ritmo de produção (m³/h)"},{ghost:true,label:"Capacidade pelo manual (dos que rodaram)"}]).concat(hasT?[
+          {line:true,label:"Meta de disponibilidade "+fmtPct(target)},
           {text:below?("Abaixo da meta em "+below+" de "+counted+" "+unitPlural):("Dentro da meta em todos os "+counted+" "+unitPlural)}]:[])
       });
+
+      // Ritmo médio com um misturador e com os dois: é o que permite medir o m³/h de cada configuração.
+      // Um dia conta como "1 misturador" quando os dois quase não rodaram juntos (menos de 10% do tempo)
+      // e como "2 misturadores" quando rodaram juntos em pelo menos metade do tempo.
+      const ONE_MAX=.1, TWO_MIN=.5;
+      const infoDay=function(d){ return {d:d,i:rateInfo([d],mixers)}; };
+      const dayInfos=rated.map(infoDay).filter(function(x){return x.i.bothFrac!==null;});
+      const cfg=function(label,note,test){
+        const sel=dayInfos.filter(function(x){return test(x.i.bothFrac);});
+        if(!sel.length) return '<article class="card kpi"><span>'+esc(label)+'</span><strong>N/D</strong><small>nenhum dia com produção lançada no período</small><small>'+esc(note)+'</small></article>';
+        const rs=sel.map(function(x){return x.d.m3_per_running_hour;});
+        const avg=rs.reduce(function(a,b){return a+b;},0)/rs.length;
+        const inf=rateInfo(sel.map(function(x){return x.d;}),mixers);
+        const manual=inf.capacity;
+        return '<article class="card kpi"><span>'+esc(label)+'</span><strong>'+esc(fmtRate(avg))+' m³/h</strong>'+
+          '<small>média de '+plural(sel.length,"dia","dias")+' · de '+esc(fmtRate(Math.min.apply(null,rs)))+' a '+esc(fmtRate(Math.max.apply(null,rs)))+' m³/h</small>'+
+          '<small>manual: '+esc(fmtNum(manual,0))+' m³/h'+(manual>0?' ('+esc(fmtNum(avg/manual*100,0))+'% do manual)':'')+'</small>'+
+          '<small>'+esc(note)+'</small></article>';
+      };
+      const mixed=dayInfos.filter(function(x){return x.i.bothFrac>=ONE_MAX && x.i.bothFrac<TWO_MIN;}).length;
+      $("capRates").innerHTML='<h4 class="ind-sub-title" style="margin-top:18px">Ritmo médio por configuração · dias com produção lançada</h4>'+
+        '<section class="kpi-grid cap-rates">'+
+        cfg("Com 1 misturador rodando","dias em que os dois quase não rodaram juntos (menos de 10% do tempo)",function(f){return f<ONE_MAX;})+
+        cfg("Com os 2 misturadores rodando","dias em que os dois rodaram juntos em pelo menos metade do tempo",function(f){return f>=TWO_MIN;})+'</section>'+
+        (mixed?'<div class="small" style="margin-top:8px">'+plural(mixed,"dia ficou","dias ficaram")+' no meio-termo (os dois rodaram juntos entre 10% e 50% do tempo) e '+(mixed===1?'não entra':'não entram')+' nas médias.</div>':'');
+
       $("capTable").innerHTML=tableTwin("tbl-cap","Ver evolução como tabela",
-        [gran==="month"?"Mês":(gran==="week"?"Semana":"Dia"),"Jornada","Disponibilidade mecânica","Capacidade em serviço","Capacidade média (m³/h)","Disponibilidade por capacidade"],
-        buckets.map(function(b){
+        [gran==="month"?"Mês":(gran==="week"?"Semana":"Dia"),"Jornada","Disponibilidade mecânica","Capacidade em serviço","Disponibilidade por capacidade","Ritmo (m³/h)","Capacidade pelo manual (m³/h)"],
+        buckets.map(function(b,i){
+          const info=infoOf.get(b.key);
           return [gran==="month"?fmtMonth(b.key):(gran==="week"?"Semana de "+fmtDay(b.key):fmtDayFull(b.key)),
-            fmtShort(b.journey_seconds),fmtPct(b.availability_percent),fmtPct(b.capacity_in_service_percent),
-            isNum(b.capacity_m3h)?fmtNum(b.capacity_m3h,0):"N/D",fmtPct(b.capacity_availability_percent)];
+            fmtShort(b.journey_seconds),fmtPct(b.availability_percent),fmtPct(b.capacity_in_service_percent),fmtPct(b.capacity_availability_percent),
+            rates[i]===null?"—":fmtRate(rates[i]),isNum(info.capacity)?fmtNum(info.capacity,0):"—"];
         }),1);
     }
 
@@ -2045,6 +2130,23 @@
     .viz-legend i.mark{width:14px;height:3px;border-radius:1px;background:var(--text)}
     .viz-legend .txt{color:var(--muted)}
 
+    /* Colunas lado a lado, eixo da direita e contorno de capacidade */
+    .viz.has-y2{grid-template-columns:42px minmax(0,1fr) 46px}
+    .viz-y2{position:relative}
+    .viz-y2 span{position:absolute;left:0;transform:translateY(50%);font-size:11px;line-height:1;color:var(--muted);font-variant-numeric:tabular-nums}
+    .viz-grp{display:flex;gap:3px;align-items:flex-end;justify-content:center;width:100%;height:100%}
+    .viz-b{position:relative;flex:0 1 22px;min-width:0;height:100%;display:flex;align-items:flex-end}
+    .viz-b .viz-bar{max-width:none}
+    .viz-b .viz-val{font-size:10.5px;padding:0 1px}
+    .viz-b .viz-mark{max-width:none;width:100%}
+    .viz-ghost{position:absolute;left:0;right:0;bottom:0;border:1.5px dashed var(--text-2);border-bottom:0;border-radius:4px 4px 0 0;pointer-events:none;z-index:1}
+    .viz-legend i.ghost{width:12px;height:12px;border:1.5px dashed var(--text-2);border-radius:3px;background:transparent}
+    .cap-rates{grid-template-columns:repeat(auto-fit,minmax(240px,1fr));margin-top:8px}
+    @media (max-width:560px){
+      .viz.has-y2{grid-template-columns:34px minmax(0,1fr) 36px}
+    }
+
+
     /* Motivos das paradas */
     .stop-card .cat-split{display:flex;height:22px;gap:2px;margin:6px 0 10px;border-radius:7px;overflow:hidden}
     .stop-card .cat-split span{display:block;min-width:2px}
@@ -2286,7 +2388,7 @@
     <div class="small" style="margin-bottom:12px">Cada misturador vale a sua fatia da capacidade nominal (manual: 100 m³/h cada, 200 m³/h com os dois). Com um misturador fora de serviço o dia todo, a disponibilidade do período cai para a fatia que sobrou. Mostra o efeito real da falta de um misturador, mas só faz sentido se a demanda exige os dois. A disponibilidade mecânica da aba Gestão continua igual.</div>
     <section id="capGrid" class="indicator-grid"><div class="card empty">Carregando...</div></section>
     <section id="capTrendSection" class="hidden" style="margin-top:14px">
-      <article class="card"><div class="chart-head"><div><h3 id="capChartTitle">Disponibilidade por capacidade</h3><p id="capChartSub" class="muted"></p></div></div><div id="capChart" class="viz-host"></div></article>
+      <article class="card"><div class="chart-head"><div><h3 id="capChartTitle">Capacidade disponível e produção</h3><p id="capChartSub" class="muted"></p></div></div><div id="capChart" class="viz-host"></div><div id="capRates"></div></article>
       <div id="capTable"></div>
     </section>
 
