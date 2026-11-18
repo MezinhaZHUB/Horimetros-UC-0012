@@ -75,6 +75,8 @@ const SCOPE_BY_KIND = new Map<string, string>([
   ["save_stop", "gestao"],
   ["save_day", "gestao"],
   ["save_targets", "gestao"],
+  ["save_mixer_outage", "gestao"],
+  ["delete_mixer_outage", "gestao"],
   ["save_production", "producao"],
   ["delete_production", "producao"],
 ]);
@@ -265,6 +267,24 @@ function kpiFrom(journey: number, running: number, unavail: number, loss: number
   };
 }
 
+// Disponibilidade por capacidade = (jornada - indisponibilidade) x fracao da capacidade em servico / jornada.
+// Com um dos dois misturadores fora o dia todo e a usina sem indisponibilidade, da 50%.
+function capacityKpi(list: any[], nominal: number) {
+  let journey = 0, num = 0, cap = 0;
+  for (const d of list) {
+    const j = Number(d.kpi?.journey_seconds) || 0;
+    const u = Number(d.kpi?.unavailability_seconds) || 0;
+    const f = Number(d.capacity?.fraction ?? 1);
+    journey += j; num += (j - u) * f; cap += j * f;
+  }
+  return {
+    capacity_availability_percent: journey > 0 ? clampPct(num / journey * 100) : null,
+    capacity_in_service_percent: journey > 0 ? clampPct(cap / journey * 100) : null,
+    capacity_m3h: journey > 0 ? cap / journey * nominal : null,
+    nominal_m3h: nominal
+  };
+}
+
 function bucketKey(date: string, gran: string) {
   if (gran === "day") return date;
   if (gran === "month") return date.slice(0, 7);
@@ -285,7 +305,7 @@ async function audit(action: string, operationDate: string | null, entityType: s
   if (error) console.error("audit:", error);
 }
 
-async function overview(startDate: string, endDate: string, compact = false) {
+async function overview(startDate: string, endDate: string, compact = false, granularityOverride: string | null = null) {
   const firstMs = dayStartMs(startDate);
   const lastMs = dayStartMs(addDays(endDate, 1));
   const queryEnd = new Date(lastMs + 86400000).toISOString();
@@ -300,7 +320,7 @@ async function overview(startDate: string, endDate: string, compact = false) {
   const officialStart = cfg?.official_started_at ? Date.parse(cfg.official_started_at) : firstMs;
   const queryStart = new Date(Math.min(firstMs - 86400000, officialStart - 86400000)).toISOString();
 
-  const [eventsReq, stateReq, reasonsReq, dayReq, stopReq, prodReq, mixReq, targetsReq] = await Promise.all([
+  const [eventsReq, stateReq, reasonsReq, dayReq, stopReq, prodReq, mixReq, targetsReq, mixerCfgReq, outageReq] = await Promise.all([
     fetchAll((from, to) => supabase.from("equipment_events")
       .select("event_type,motor_id,event_time,received_at,duration_seconds")
       .eq("device_id", DEVICE_ID)
@@ -332,14 +352,42 @@ async function overview(startDate: string, endDate: string, compact = false) {
     supabase.from("plant_mix_catalog")
       .select("id,mix_name,is_primary,display_order").eq("enabled", true).order("display_order"),
     supabase.from("plant_targets")
-      .select("metric,target_percent,updated_at").eq("device_id", DEVICE_ID)
+      .select("metric,target_percent,updated_at").eq("device_id", DEVICE_ID),
+    supabase.from("plant_mixer_config")
+      .select("motor_id,name,capacity_m3h").eq("device_id", DEVICE_ID).order("motor_id"),
+    supabase.from("plant_mixer_outages")
+      .select("id,motor_id,start_date,end_date,reason_code,note,updated_at")
+      .eq("device_id", DEVICE_ID).order("start_date").order("id")
   ]);
 
-  const errors = [eventsReq.error, stateReq.error, reasonsReq.error, dayReq.error, stopReq.error, prodReq.error, mixReq.error, targetsReq.error].filter(Boolean);
+  const errors = [eventsReq.error, stateReq.error, reasonsReq.error, dayReq.error, stopReq.error, prodReq.error, mixReq.error, targetsReq.error, mixerCfgReq.error, outageReq.error].filter(Boolean);
   if (errors.length) throw errors[0];
   const officialOffset = num(cfg?.initial_offset_seconds);
   const officialDate = dateKey(officialStart);
   const mixerIds = new Set<number>((cfg?.mixer_motor_ids ?? [0,1]).map((x: unknown) => Number(x)));
+
+  // ---- Capacidade: cada misturador vale a sua fatia (manual: 100 m3/h cada). Situacao declarada por periodo. ----
+  const mixerCfg = new Map<number, { name: string; capacity: number }>();
+  for (const id of Array.from(mixerIds).sort((a, b) => a - b)) {
+    const row: any = (mixerCfgReq.data ?? []).find((x: any) => Number(x.motor_id) === id);
+    const st: any = (stateReq.data ?? []).find((x: any) => Number(x.motor_id) === id);
+    const cap = row ? Number(row.capacity_m3h) : NaN;
+    mixerCfg.set(id, { name: row?.name ?? st?.name ?? `Misturador ${id}`, capacity: Number.isFinite(cap) && cap > 0 ? cap : 100 });
+  }
+  const nominalM3h = Array.from(mixerCfg.values()).reduce((s, m) => s + m.capacity, 0);
+  const outageRows = (outageReq.data ?? []).map((o: any) => ({
+    id: Number(o.id), motor_id: Number(o.motor_id), start_date: String(o.start_date),
+    end_date: o.end_date ? String(o.end_date) : null, reason_code: o.reason_code ?? null, note: o.note ?? null,
+    updated_at: o.updated_at ?? null
+  }));
+  const inService = (id: number, date: string) =>
+    !outageRows.some((o: any) => o.motor_id === id && o.start_date <= date && (o.end_date === null || o.end_date >= date));
+  const capacityOf = (date: string) => {
+    let available = 0;
+    const flags: Record<number, boolean> = {};
+    for (const [id, m] of mixerCfg) { const ok = inService(id, date); flags[id] = ok; if (ok) available += m.capacity; }
+    return { nominal_m3h: nominalM3h, available_m3h: available, fraction: nominalM3h > 0 ? available / nominalM3h : 0, in_service: flags };
+  };
 
   const byMotor = new Map<number, Interval[]>();
   for (const id of [0,1,2]) byMotor.set(id, []);
@@ -477,6 +525,14 @@ async function overview(startDate: string, endDate: string, compact = false) {
       .reduce((s,x)=>s+num(x.duration_seconds),0);
 
     const runningSeconds = seconds(clippedRuns);
+    const excludedSegs = timeline.filter(x => x.type === "STOPPED" && x.affects_availability === false);
+    const mixerRun: Record<number, number> = {};
+    for (const id of mixerCfg.keys()) {
+      const own = mergeIntervals(clipIntervals(byMotor.get(id) ?? [], start, end), 60);
+      let sec = seconds(own);
+      for (const ex of excludedSegs) sec -= seconds(clipIntervals(own, Date.parse(ex.start_at), Date.parse(ex.end_at)));
+      mixerRun[id] = Math.max(0, sec);
+    }
     const totalWindow = Math.max(0,(end-start)/1000);
     const scheduledSeconds = Math.max(0,totalWindow-excludedAvailabilitySeconds);
     const downtimeSeconds = Math.max(0,scheduledSeconds-runningSeconds);
@@ -509,6 +565,8 @@ async function overview(startDate: string, endDate: string, compact = false) {
       excluded_availability_seconds: excludedAvailabilitySeconds,
       availability_percent: availability,
       kpi: dayKpi,
+      capacity: capacityOf(date),
+      mixer_running_seconds: mixerRun,
       timeline,
       production: (prodReq.data ?? []).filter((p:any)=>p.operation_date===date)
     });
@@ -574,14 +632,14 @@ async function overview(startDate: string, endDate: string, compact = false) {
   };
 
   // ---- Evolucao do periodo (por dia, semana ou mes, conforme o tamanho do periodo) ----
-  const granularity = dates.length <= 31 ? "day" : dates.length <= 140 ? "week" : "month";
+  const granularity = granularityOverride ?? (dates.length <= 31 ? "day" : dates.length <= 140 ? "week" : "month");
   const buckets = new Map<string, any[]>();
   for (const d of activeDays) {
     const k = bucketKey(d.date, granularity);
     if (!buckets.has(k)) buckets.set(k, []);
     buckets.get(k)!.push(d);
   }
-  const trend = Array.from(buckets.entries()).sort((a, b) => a[0].localeCompare(b[0])).map(([key, list]) => ({
+  const trend: any[] = Array.from(buckets.entries()).sort((a, b) => a[0].localeCompare(b[0])).map(([key, list]) => ({
     key,
     from_date: list[0].date,
     to_date: list[list.length - 1].date,
@@ -590,7 +648,8 @@ async function overview(startDate: string, endDate: string, compact = false) {
       sumKpi(list, "journey_seconds"), sumKpi(list, "running_seconds"),
       sumKpi(list, "unavailability_seconds"), sumKpi(list, "efficiency_loss_seconds"),
       sumKpi(list, "unclassified_seconds"), sumKpi(list, "excluded_seconds")
-    )
+    ),
+    ...capacityKpi(list, nominalM3h)
   }));
 
   const componentStats: any[] = [];
@@ -641,6 +700,29 @@ async function overview(startDate: string, endDate: string, compact = false) {
     const d = String(p.operation_date);
     volumeByDate.set(d, (volumeByDate.get(d) ?? 0) + num(p.volume_m3));
   }
+  // Producao por linha (misturador): o volume e lancado por dia. Se so um misturador rodou, e todo dele (exato);
+  // se os dois rodaram, divide pelas horas de cada um (aproximado).
+  const lineIds = Array.from(mixerCfg.keys());
+  const linesFor = (d: any, vol: number | null) => {
+    const run = d.mixer_running_seconds ?? {};
+    const active = lineIds.filter(id => num(run[id]) > 0);
+    const totalRun = active.reduce((s, id) => s + num(run[id]), 0);
+    const exact = active.length === 1;
+    return lineIds.map(id => {
+      const r = num(run[id]);
+      const has = vol !== null && vol > 0 && totalRun > 0;
+      const v = has ? vol! * (r / totalRun) : null;
+      return {
+        motor_id: id,
+        name: mixerCfg.get(id)!.name,
+        running_seconds: r,
+        share_percent: has ? r / totalRun * 100 : null,
+        volume_m3: v,
+        m3_per_running_hour: v !== null && v > 0 && r > 0 ? v / (r / 3600) : null,
+        exact
+      };
+    });
+  };
   const productionDaily = days.filter((d:any) => !d.before_official_start).map((d:any) => {
     const vol = volumeByDate.has(d.date) ? volumeByDate.get(d.date)! : null;
     const runH = num(d.running_seconds) / 3600;
@@ -653,7 +735,9 @@ async function overview(startDate: string, endDate: string, compact = false) {
       running_seconds: num(d.running_seconds),
       journey_seconds: num(d.scheduled_seconds),
       m3_per_running_hour: vol !== null && vol > 0 && runH > 0 ? vol / runH : null,
-      m3_per_journey_hour: vol !== null && vol > 0 && jorH > 0 ? vol / jorH : null
+      m3_per_journey_hour: vol !== null && vol > 0 && jorH > 0 ? vol / jorH : null,
+      capacity_m3h: capacityOf(d.date).available_m3h,
+      lines: linesFor(d, vol)
     };
   });
   const rated = productionDaily.filter((x:any) => x.m3_per_running_hour !== null);
@@ -679,6 +763,79 @@ async function overview(startDate: string, endDate: string, compact = false) {
       avg_m3_per_running_hour: mean(list, "m3_per_running_hour"),
       avg_m3_per_journey_hour: mean(list.filter((x:any) => x.m3_per_journey_hour !== null), "m3_per_journey_hour")
     }))
+  };
+
+  // Producao e ritmo por balde da evolucao (o ritmo do balde e a media das taxas diarias, como na aba Producao).
+  for (const b of trend) {
+    const inB = (date: string) => bucketKey(date, granularity) === b.key;
+    let vol = 0, hasVol = false;
+    for (const [date, v] of volumeByDate) if (inB(date)) { vol += v; hasVol = true; }
+    const rates = rated.filter((x: any) => inB(x.date));
+    b.volume_m3 = hasVol ? vol : null;
+    b.m3_per_running_hour = mean(rates, "m3_per_running_hour");
+    b.rated_days = rates.length;
+  }
+
+  // Resumo por linha no periodo.
+  const lineMonths = new Map<string, Record<number, number>>();
+  const lineTotals = lineIds.map(id => ({
+    motor_id: id, name: mixerCfg.get(id)!.name, capacity_m3h: mixerCfg.get(id)!.capacity,
+    total_m3: 0, running_seconds: 0, exact_days: 0, approx_days: 0, rates: [] as number[]
+  }));
+  let unattributed = 0;
+  for (const x of productionDaily) {
+    const vol = x.volume_m3 ?? 0;
+    const got = x.lines.reduce((s: number, l: any) => s + (l.volume_m3 ?? 0), 0);
+    if (vol > 0 && got <= 0) unattributed += vol;
+    for (const l of x.lines) {
+      const t = lineTotals.find(y => y.motor_id === l.motor_id)!;
+      t.running_seconds += l.running_seconds;
+      if (l.volume_m3 !== null && l.volume_m3 > 0) {
+        t.total_m3 += l.volume_m3;
+        if (l.exact) t.exact_days += 1; else t.approx_days += 1;
+        if (l.m3_per_running_hour !== null) t.rates.push(l.m3_per_running_hour);
+        const mk = x.date.slice(0, 7);
+        const row = lineMonths.get(mk) ?? {};
+        row[l.motor_id] = (row[l.motor_id] ?? 0) + l.volume_m3;
+        lineMonths.set(mk, row);
+      }
+    }
+  }
+  const attributedTotal = lineTotals.reduce((s, t) => s + t.total_m3, 0);
+  const productionLines = {
+    lines: lineTotals.map(t => ({
+      motor_id: t.motor_id, name: t.name, capacity_m3h: t.capacity_m3h,
+      total_m3: t.total_m3, running_seconds: t.running_seconds,
+      share_percent: attributedTotal > 0 ? t.total_m3 / attributedTotal * 100 : null,
+      avg_m3_per_running_hour: t.rates.length ? t.rates.reduce((s, v) => s + v, 0) / t.rates.length : null,
+      exact_days: t.exact_days, approx_days: t.approx_days
+    })),
+    unattributed_m3: unattributed,
+    months: Array.from(lineMonths.entries()).sort((a, b) => a[0].localeCompare(b[0]))
+      .map(([month, v]) => ({ month, volumes: lineIds.map(id => ({ motor_id: id, volume_m3: v[id] ?? 0 })) }))
+  };
+
+  // Capacidade do periodo e situacao de cada misturador.
+  const capacity = {
+    nominal_m3h: nominalM3h,
+    kpi: capacityKpi(activeDays, nominalM3h),
+    mixers: lineIds.map(id => {
+      const m = mixerCfg.get(id)!;
+      let runSec = 0, ranWhileOut = 0, outDays = 0, inDays = 0;
+      for (const d of activeDays) {
+        const r = num(d.mixer_running_seconds?.[id]);
+        runSec += r;
+        if (d.capacity?.in_service?.[id] === false) { outDays += 1; ranWhileOut += r; } else inDays += 1;
+      }
+      return {
+        motor_id: id, name: m.name, capacity_m3h: m.capacity,
+        share_percent: nominalM3h > 0 ? m.capacity / nominalM3h * 100 : null,
+        running_seconds: runSec, in_service_days: inDays, out_days: outDays,
+        ran_while_out_seconds: ranWhileOut,
+        out_now: !inService(id, today)
+      };
+    }),
+    outages: outageRows
   };
 
   const targets = { availability_percent: null as number | null, efficiency_percent: null as number | null, updated_at: null as string | null };
@@ -720,7 +877,9 @@ async function overview(startDate: string, endDate: string, compact = false) {
       m3_per_running_hour: totalRunning>0 ? productionTotal/(totalRunning/3600) : null
     },
     production_daily: productionDaily,
-    production_hourly: productionHourly
+    production_hourly: productionHourly,
+    production_lines: productionLines,
+    capacity
   };
 }
 
@@ -742,7 +901,8 @@ Deno.serve(async (req: Request) => {
       const end = typeof body.end === "string" ? body.end : "";
       if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end) || start > end)
         return json(req,{ok:false,error:"Periodo invalido"},400);
-      return json(req, await overview(start,end,body.compact === true));
+      const gran = ["day","week","month"].includes(String(body.granularity)) ? String(body.granularity) : null;
+      return json(req, await overview(start,end,body.compact === true,gran));
     }
 
     const scope = SCOPE_BY_KIND.get(String(body.kind ?? ""));
@@ -897,6 +1057,57 @@ Deno.serve(async (req: Request) => {
       if (error) throw error;
       await audit("DELETE_PRODUCTION",before?.operation_date ?? null,"production",String(id),before,null);
       return json(req,{ok:true,kind:"production_deleted"});
+    }
+
+    if (body.kind === "save_mixer_outage") {
+      const motor = Number(body.motor_id);
+      const startD = String(body.start_date ?? "");
+      const endD = body.end_date ? String(body.end_date) : null;
+      const reason = body.reason_code ? String(body.reason_code).slice(0, 60) : null;
+      const note = String(body.note ?? "").trim().slice(0, 500) || null;
+      const id = body.id === undefined || body.id === null || body.id === "" ? null : Number(body.id);
+      if (!Number.isInteger(motor) || !/^\d{4}-\d{2}-\d{2}$/.test(startD) || (endD !== null && !/^\d{4}-\d{2}-\d{2}$/.test(endD)) ||
+          (id !== null && (!Number.isInteger(id) || id <= 0)))
+        return json(req,{ok:false,error:"Dados da parada do misturador invalidos"},400);
+      if (endD !== null && endD < startD) return json(req,{ok:false,error:"A data final não pode ser anterior à inicial"},400);
+      const known = await supabase.from("plant_mixer_config").select("motor_id").eq("device_id",DEVICE_ID).eq("motor_id",motor).maybeSingle();
+      if (known.error) throw known.error;
+      if (!known.data) return json(req,{ok:false,error:"Misturador desconhecido"},400);
+      if (reason) {
+        const r = await supabase.from("plant_management_reason_catalog").select("reason_code,category").eq("reason_code",reason).eq("enabled",true).maybeSingle();
+        if (r.error) throw r.error;
+        if (!r.data || r.data.category !== "unavailability")
+          return json(req,{ok:false,error:"Use um motivo de indisponibilidade"},400);
+      }
+      const row = { device_id:DEVICE_ID, motor_id:motor, start_date:startD, end_date:endD, reason_code:reason, note, updated_at:new Date().toISOString() };
+      let before: unknown = null;
+      let saved: any = null;
+      if (id !== null) {
+        const b = await supabase.from("plant_mixer_outages").select("*").eq("id",id).eq("device_id",DEVICE_ID).maybeSingle();
+        if (b.error) throw b.error;
+        if (!b.data) return json(req,{ok:false,error:"Registro não encontrado"},404);
+        before = b.data;
+        const u = await supabase.from("plant_mixer_outages").update(row).eq("id",id).eq("device_id",DEVICE_ID).select().single();
+        if (u.error) throw u.error;
+        saved = u.data;
+      } else {
+        const i = await supabase.from("plant_mixer_outages").insert(row).select().single();
+        if (i.error) throw i.error;
+        saved = i.data;
+      }
+      await audit("SAVE_MIXER_OUTAGE",startD,"mixer_outage",String(saved.id),before,saved);
+      return json(req,{ok:true,kind:"mixer_outage_saved",record:saved});
+    }
+
+    if (body.kind === "delete_mixer_outage") {
+      const id = Number(body.id);
+      if (!Number.isInteger(id) || id <= 0) return json(req,{ok:false,error:"ID invalido"},400);
+      const b = await supabase.from("plant_mixer_outages").select("*").eq("id",id).eq("device_id",DEVICE_ID).maybeSingle();
+      if (b.error) throw b.error;
+      const d = await supabase.from("plant_mixer_outages").delete().eq("id",id).eq("device_id",DEVICE_ID);
+      if (d.error) throw d.error;
+      await audit("DELETE_MIXER_OUTAGE",b.data?.start_date ?? null,"mixer_outage",String(id),b.data,null);
+      return json(req,{ok:true,kind:"mixer_outage_deleted"});
     }
 
     return json(req,{ok:false,error:"kind invalido"},400);

@@ -238,7 +238,7 @@
         overviews[scope]=data;
         renderOfficial(data);
         if(scope==="gestao") renderGestao(data);
-        if(scope==="componentes") renderComponents(data.components||[]);
+        if(scope==="componentes") renderComponents(data);
         if(scope==="producao") renderProducao(data);
         if(scope==="metas") renderTargets(data);
         restoreOpen(open);
@@ -350,20 +350,32 @@
         if(gran==="day") return weekdayShort(b.key)+" "+fmtDayFull(b.key);
         return (gran==="week"?"Semana de "+fmtDay(b.key):fmtMonth(b.key))+" · "+plural(b.days_count,"dia","dias")+" de operação";
       };
+      const unitPlural=gran==="day"?"dias":(gran==="week"?"semanas":"meses");
+      const isNum=function(v){ return v!==null && v!==undefined && Number.isFinite(v); };
       const build=function(hostId,valueKey,color,target,tipRows){
         const vals=buckets.map(function(b){return b[valueKey];});
         const show=pickLabels(vals,12);
         const hasT=target!==null && target!==undefined;
+        const name=hostId==="trendAvail"?"Disponibilidade":"Eficiência";
+        const counted=vals.filter(isNum).length;
+        const below=hasT?vals.filter(function(v){return isNum(v) && v<target;}).length:0;
         columnChart($(hostId),{
           max:100,ticks:[0,25,50,75,100],fmtTick:function(v){return v+"%";},
           cols:buckets.map(function(b,i){
             const v=b[valueKey];
-            return {value:v,color:color,x:xLabel(b),label:show.has(i)?fmtPct0(v):null,
-              aria:tipTitle(b)+": "+fmtPct(v),
-              tip:{title:tipTitle(b),rows:tipRows(b,v)}};
+            const miss=hasT && isNum(v) && v<target;
+            const rows=tipRows(b,v);
+            if(hasT && isNum(v)){
+              rows.push({label:"Meta",value:fmtPct(target)});
+              rows.push({label:miss?"Abaixo da meta":"Dentro da meta",value:fmtPp(v-target)});
+            }
+            return {value:v,color:color,miss:miss,x:xLabel(b),label:show.has(i)?fmtPct0(v):null,
+              aria:tipTitle(b)+": "+fmtPct(v)+(miss?" (abaixo da meta)":""),
+              tip:{title:tipTitle(b),rows:rows}};
           }),
-          ref:hasT?{value:target,label:"Meta "+fmtPct(target)}:null,
-          legend:hasT?[{color:color,label:hostId==="trendAvail"?"Disponibilidade":"Eficiência"},{line:true,label:"Meta "+fmtPct(target)}]:[]
+          ref:hasT?{value:target}:null,
+          legend:hasT?[{color:color,label:name},{color:color,miss:true,label:"Abaixo da meta"},{line:true,label:"Meta "+fmtPct(target)},
+            {text:below?("Abaixo da meta em "+below+" de "+counted+" "+unitPlural):("Dentro da meta em todos os "+counted+" "+unitPlural)}]:[]
         });
       };
       build("trendAvail","availability_percent","var(--series-2)",t.availability_percent,function(b,v){
@@ -548,27 +560,40 @@
     window.addEventListener("scroll",hideTip,{passive:true});
     document.addEventListener("keydown",function(ev){ if(ev.key==="Escape") hideTip(); });
 
-    // o = { cols:[{value,color,x,label,aria,tip:{title,rows:[{color,label,value}]}}], max, ticks, fmtTick, ref:{value,label}, legend:[{color,label,line}], plotH }
+    // o = { cols:[{value,color,x,label,aria,miss,mark,stack:[{value,color}],tip:{title,rows}}], max, ticks, fmtTick,
+    //       ref:{value}, legend:[{color,label,line,dash,mark,miss,text}], plotH }
+    // miss = coluna abaixo da meta (listrada); mark = traço curto de referência sobre a coluna; ref = linha de meta.
     function columnChart(host,o){
       hideTip();
       const max=o.max, plotH=o.plotH||200;
       const pos=function(v){ return Math.max(0,Math.min(100,v/max*100)); };
+      const isNum=function(v){ return v!==null && v!==undefined && Number.isFinite(v); };
       const yAxis=o.ticks.map(function(t){return '<span style="bottom:'+pos(t)+'%">'+esc(o.fmtTick(t))+'</span>';}).join("");
       const grid=o.ticks.filter(function(t){return t>0;}).map(function(t){return '<i class="viz-grid" style="bottom:'+pos(t)+'%"></i>';}).join("");
       const n=o.cols.length;
       const cols=o.cols.map(function(c,i){
-        const has=c.value!==null && c.value!==undefined && Number.isFinite(c.value);
+        const has=isNum(c.value);
         const h=has?pos(c.value):0;
-        return '<div class="viz-col" tabindex="0" data-i="'+i+'" role="img" aria-label="'+esc(c.aria||"")+'">'+
-          '<span class="viz-bar" style="height:'+h+'%;background:'+(has?c.color:"var(--border-strong)")+'"></span>'+
+        let bar;
+        if(has && c.stack){
+          bar='<span class="viz-bar stack" style="height:'+h+'%">'+c.stack.map(function(s){
+            const f=c.value>0?s.value/c.value*100:0;
+            return f>0?'<i class="viz-seg" style="height:'+f+'%;background-color:'+s.color+'"></i>':'';
+          }).join("")+'</span>';
+        }else{
+          bar='<span class="viz-bar'+(c.miss?' miss':'')+'" style="height:'+h+'%;background-color:'+(has?c.color:"var(--border-strong)")+'"></span>';
+        }
+        return '<div class="viz-col" tabindex="0" data-i="'+i+'" role="img" aria-label="'+esc(c.aria||"")+'">'+bar+
+          (isNum(c.mark)?'<i class="viz-mark" style="bottom:'+pos(c.mark)+'%"></i>':'')+
           (c.label && has?'<span class="viz-val" style="bottom:calc('+h+'% + 4px)">'+esc(c.label)+'</span>':'')+
           '</div>';
       }).join("");
       const step=n>24?3:(n>14?2:1);
       const xAxis=o.cols.map(function(c,i){return '<span>'+(i%step===0?esc(c.x):"")+'</span>';}).join("");
-      const ref=o.ref?'<div class="viz-ref" style="bottom:'+pos(o.ref.value)+'%"></div>':"";
+      const ref=o.ref&&isNum(o.ref.value)?'<div class="viz-ref" style="bottom:'+pos(o.ref.value)+'%"></div>':"";
       const legend=(o.legend&&o.legend.length)?'<div class="viz-legend">'+o.legend.map(function(l){
-        return '<span><i class="'+(l.line?'line':'')+'"'+(l.color?' style="background:'+l.color+'"':'')+'></i>'+esc(l.label)+'</span>';
+        if(l.text) return '<span class="txt">'+esc(l.text)+'</span>';
+        return '<span><i class="'+(l.line?'line':'')+(l.dash?' dash':'')+(l.mark?' mark':'')+(l.miss?' miss':'')+'"'+(l.color?' style="background-color:'+l.color+'"':'')+'></i>'+esc(l.label)+'</span>';
       }).join("")+'</div>':"";
       host.innerHTML=legend+'<div class="viz" style="--plot-h:'+plotH+'px"><div class="viz-y">'+yAxis+'</div>'+
         '<div class="viz-plot">'+grid+'<div class="viz-cols">'+cols+'</div>'+ref+'</div><div class="viz-x">'+xAxis+'</div></div>';
@@ -696,7 +721,8 @@
       if(current && rows.some(function(r){return r.reason_code===current;})) select.value=current;
     }
 
-    function renderComponents(rows){
+    function renderComponents(data){
+      const rows=data.components||[];
       $("componentsGrid").innerHTML=rows.map(function(c){
         const label=Number(c.motor_id)===2?"Correia Transportadora":c.name;
         return '<article class="card component-card"><div class="card-head"><h3>'+esc(label)+'</h3><span class="state '+(c.running?"running":"stopped")+'">'+(c.running?"● LIGADO":"● PARADO")+'</span></div>'+
@@ -704,6 +730,176 @@
           '<div class="mini-grid"><div><span>Horímetro individual</span><strong>'+fmtSec(c.hourmeter_seconds)+'</strong></div>'+
           '<div><span>Horas ligado no período</span><strong>'+fmtShort(c.period_running_seconds)+'</strong></div></div></article>';
       }).join("");
+      renderCapacity(data);
+      renderCapacityChart(data);
+      renderOutages(data);
+    }
+
+    // ---------- Componentes: disponibilidade por capacidade ----------
+    let outageEditId=null;
+
+    function currentOutage(cap,motorId,today){
+      return (cap.outages||[]).find(function(o){
+        return o.motor_id===motorId && o.start_date<=today && (o.end_date===null || o.end_date>=today);
+      });
+    }
+
+    function renderCapacity(data){
+      const cap=data.capacity||{}, kpi=cap.kpi||{}, mixers=cap.mixers||[], t=data.targets||{}, k=data.kpi||{};
+      const today=localDate();
+      const reasonName=new Map((data.reasons||[]).map(function(r){return [r.reason_code,r.label];}));
+      const value=kpi.capacity_availability_percent;
+      const hasBase=(k.journey_seconds||0)>0 && value!==null && value!==undefined;
+
+      let left='<article class="card indicator avail"><div class="ind-head"><div><h3>Disponibilidade por capacidade</h3><p class="muted">Quanto da capacidade da usina esteve em condições de produzir. Cada misturador vale a sua fatia.</p></div></div>';
+      if(!hasBase){
+        left+='<div class="empty-note" style="margin-top:14px">Sem jornada registrada no período, então este indicador não pode ser calculado.</div>';
+      }else{
+        left+='<div class="ind-figure"><strong>'+esc(fmtPct(value))+'</strong>'+targetChip(value,t.availability_percent)+'</div>'+meter(value,t.availability_percent)+
+          '<div class="ind-sub muted">Disponibilidade mecânica (aba Gestão): <b>'+esc(fmtPct(k.availability_percent))+'</b></div>'+
+          '<div class="ind-sub muted">Capacidade em serviço: <b>'+esc(fmtPct(kpi.capacity_in_service_percent))+'</b> · média de <b>'+esc(fmtNum(kpi.capacity_m3h,0))+' m³/h</b> de '+esc(fmtNum(kpi.nominal_m3h,0))+' m³/h</div>'+
+          '<div class="ind-sub muted">Usa a mesma meta de disponibilidade da aba Metas.</div>';
+      }
+      left+='</article>';
+
+      const mixerRows=mixers.map(function(m){
+        const out=currentOutage(cap,m.motor_id,today);
+        const since=out?("Fora de serviço desde "+fmtDayFull(out.start_date)+(out.end_date?" até "+fmtDayFull(out.end_date):"")):"Em serviço";
+        const why=out && out.reason_code && reasonName.get(out.reason_code)?" · "+reasonName.get(out.reason_code):"";
+        const meta="Em serviço em "+plural(m.in_service_days,"dia","dias")+" · fora em "+plural(m.out_days,"dia","dias")+" · "+fmtShort(m.running_seconds)+" rodando no período";
+        const warn=m.ran_while_out_seconds>0
+          ?'<div class="mixer-meta warn">⚠ Rodou '+esc(fmtShort(m.ran_while_out_seconds))+' em dias declarados fora de serviço. Confira as datas abaixo.</div>':"";
+        return '<div class="mixer-row"><div><strong>'+esc(m.name)+'</strong><small>'+esc(fmtNum(m.capacity_m3h,0))+' m³/h · '+esc(fmtPct(m.share_percent))+' da capacidade</small></div>'+
+          '<span class="state '+(out?"stopped":"running")+'">● '+esc(since)+esc(why)+'</span>'+
+          '<div class="mixer-meta">'+esc(meta)+'</div>'+warn+'</div>';
+      }).join("");
+      const right='<article class="card mixer-card"><h3>Misturadores</h3><p class="muted">Situação declarada abaixo. Misturador parado sem declaração não reduz a capacidade.</p><div class="mixer-list">'+(mixerRows||'<div class="empty-note">Sem misturadores configurados.</div>')+'</div></article>';
+      $("capGrid").innerHTML=left+right;
+    }
+
+    function renderCapacityChart(data){
+      const tr=data.trend||{}, buckets=tr.buckets||[], gran=tr.granularity||"day", t=data.targets||{};
+      const sec=$("capTrendSection");
+      if(buckets.length<2){ sec.classList.add("hidden"); $("capChart").innerHTML=""; $("capTable").innerHTML=""; return; }
+      sec.classList.remove("hidden");
+      const unit=gran==="day"?"dia":(gran==="week"?"semana":"mês");
+      const unitPlural=gran==="day"?"dias":(gran==="week"?"semanas":"meses");
+      $("capChartTitle").textContent="Disponibilidade por capacidade, por "+unit;
+      $("capChartSub").textContent="A coluna é a disponibilidade por capacidade; o traço é a disponibilidade mecânica da aba Gestão. A distância entre os dois é o efeito do misturador fora de serviço.";
+      const n=buckets.length;
+      const xLabel=function(b){ return gran==="month"?fmtMonth(b.key):((gran==="day"&&n>12)?b.key.slice(8,10):fmtDay(b.key)); };
+      const tipTitle=function(b){
+        if(gran==="day") return weekdayShort(b.key)+" "+fmtDayFull(b.key);
+        return (gran==="week"?"Semana de "+fmtDay(b.key):fmtMonth(b.key))+" · "+plural(b.days_count,"dia","dias")+" de operação";
+      };
+      const isNum=function(v){ return v!==null && v!==undefined && Number.isFinite(v); };
+      const vals=buckets.map(function(b){return b.capacity_availability_percent;});
+      const show=pickLabels(vals,12);
+      const hasT=t.availability_percent!==null && t.availability_percent!==undefined;
+      const target=t.availability_percent;
+      const counted=vals.filter(isNum).length;
+      const below=hasT?vals.filter(function(v){return isNum(v) && v<target;}).length:0;
+      const color="var(--series-2)";
+      columnChart($("capChart"),{
+        max:100,ticks:[0,25,50,75,100],fmtTick:function(v){return v+"%";},
+        cols:buckets.map(function(b,i){
+          const v=b.capacity_availability_percent;
+          const miss=hasT && isNum(v) && v<target;
+          const rows=[{color:color,label:"Disponibilidade por capacidade",value:fmtPct(v)},
+            {label:"Disponibilidade mecânica (Gestão)",value:fmtPct(b.availability_percent)},
+            {label:"Capacidade em serviço",value:fmtPct(b.capacity_in_service_percent)},
+            {label:"Capacidade média",value:isNum(b.capacity_m3h)?fmtNum(b.capacity_m3h,0)+" m³/h":"N/D"}];
+          if(hasT && isNum(v)){
+            rows.push({label:"Meta",value:fmtPct(target)});
+            rows.push({label:miss?"Abaixo da meta":"Dentro da meta",value:fmtPp(v-target)});
+          }
+          return {value:v,color:color,miss:miss,mark:b.availability_percent,x:xLabel(b),label:show.has(i)?fmtPct0(v):null,
+            aria:tipTitle(b)+": "+fmtPct(v)+(miss?" (abaixo da meta)":""),tip:{title:tipTitle(b),rows:rows}};
+        }),
+        ref:hasT?{value:target}:null,
+        legend:[{color:color,label:"Disponibilidade por capacidade"}].concat(hasT?[{color:color,miss:true,label:"Abaixo da meta"}]:[]).concat([
+          {mark:true,label:"Disponibilidade mecânica (Gestão)"}]).concat(hasT?[{line:true,label:"Meta "+fmtPct(target)},
+          {text:below?("Abaixo da meta em "+below+" de "+counted+" "+unitPlural):("Dentro da meta em todos os "+counted+" "+unitPlural)}]:[])
+      });
+      $("capTable").innerHTML=tableTwin("tbl-cap","Ver evolução como tabela",
+        [gran==="month"?"Mês":(gran==="week"?"Semana":"Dia"),"Jornada","Disponibilidade mecânica","Capacidade em serviço","Capacidade média (m³/h)","Disponibilidade por capacidade"],
+        buckets.map(function(b){
+          return [gran==="month"?fmtMonth(b.key):(gran==="week"?"Semana de "+fmtDay(b.key):fmtDayFull(b.key)),
+            fmtShort(b.journey_seconds),fmtPct(b.availability_percent),fmtPct(b.capacity_in_service_percent),
+            isNum(b.capacity_m3h)?fmtNum(b.capacity_m3h,0):"N/D",fmtPct(b.capacity_availability_percent)];
+        }),1);
+    }
+
+    function renderOutages(data){
+      const cap=data.capacity||{}, mixers=cap.mixers||[];
+      const nameOf=new Map(mixers.map(function(m){return [m.motor_id,m.name];}));
+      const sel=$("outageMotor"), curM=sel.value;
+      sel.innerHTML=mixers.map(function(m){return '<option value="'+m.motor_id+'">'+esc(m.name)+'</option>';}).join("");
+      if(curM && mixers.some(function(m){return String(m.motor_id)===curM;})) sel.value=curM;
+      const rs=$("outageReason"), curR=rs.value;
+      const reasons=(data.reasons||[]).filter(function(r){return r.category==="unavailability";});
+      rs.innerHTML='<option value="">Motivo não informado</option>'+reasons.map(function(r){return '<option value="'+esc(r.reason_code)+'">'+esc(r.label)+'</option>';}).join("");
+      if(curR && reasons.some(function(r){return r.reason_code===curR;})) rs.value=curR;
+      const label=new Map((data.reasons||[]).map(function(r){return [r.reason_code,r.label];}));
+      const rows=(cap.outages||[]).slice().sort(function(a,b){return b.start_date.localeCompare(a.start_date) || b.id-a.id;});
+      $("outageBody").innerHTML=rows.length?rows.map(function(o){
+        return '<tr><td>'+esc(nameOf.get(o.motor_id)||("Canal "+o.motor_id))+'</td><td>'+esc(fmtDayFull(o.start_date))+'</td><td>'+(o.end_date?esc(fmtDayFull(o.end_date)):'<b>em aberto</b>')+'</td>'+
+          '<td>'+(o.reason_code?esc(label.get(o.reason_code)||o.reason_code):'<span class="muted">não informado</span>')+'</td><td>'+esc(o.note||"")+'</td>'+
+          '<td><button class="small-btn edit-outage" data-id="'+o.id+'">Editar</button> <button class="small-btn danger delete-outage" data-id="'+o.id+'">Excluir</button></td></tr>';
+      }).join(""):'<tr><td colspan="6" class="empty">Nenhum período declarado. Sem declaração, os dois misturadores contam como em serviço.</td></tr>';
+      $("outageBody").querySelectorAll(".edit-outage").forEach(function(b){b.addEventListener("click",function(){editOutage(Number(b.dataset.id));});});
+      $("outageBody").querySelectorAll(".delete-outage").forEach(function(b){b.addEventListener("click",function(){deleteOutage(Number(b.dataset.id));});});
+    }
+
+    function editOutage(id){
+      const ovw=overviews.componentes;
+      const o=ovw && ovw.capacity && (ovw.capacity.outages||[]).find(function(x){return x.id===id;});
+      if(!o) return;
+      outageEditId=id;
+      $("outageMotor").value=String(o.motor_id);
+      $("outageStart").value=o.start_date;
+      $("outageEnd").value=o.end_date||"";
+      $("outageReason").value=o.reason_code||"";
+      $("outageNote").value=o.note||"";
+      $("outageFormTitle").textContent="Editar período fora de serviço";
+      $("cancelOutageEdit").classList.remove("hidden");
+      $("outageCard").scrollIntoView({behavior:"smooth"});
+    }
+
+    function clearOutageForm(){
+      outageEditId=null;
+      $("outageFormTitle").textContent="Misturador fora de serviço";
+      $("outageStart").value="";
+      $("outageEnd").value="";
+      $("outageReason").value="";
+      $("outageNote").value="";
+      $("cancelOutageEdit").classList.add("hidden");
+    }
+
+    async function saveOutage(){
+      try{
+        requirePin("compPin");
+        if(!$("outageStart").value) throw new Error("Informe a data em que o misturador saiu de serviço.");
+        if($("outageEnd").value && $("outageEnd").value<$("outageStart").value) throw new Error("A data final não pode ser anterior à inicial.");
+        setStatus("Salvando período...","pending");
+        await mgmt({kind:"save_mixer_outage",id:outageEditId,motor_id:Number($("outageMotor").value),
+          start_date:$("outageStart").value,end_date:$("outageEnd").value||null,
+          reason_code:$("outageReason").value||null,note:$("outageNote").value},"compPin");
+        setStatus("Período salvo e auditado.","oktxt");
+        clearOutageForm();
+        await loadOverview("componentes");
+      }catch(e){setStatus(e.message,"badtext");}
+    }
+
+    async function deleteOutage(id){
+      try{
+        requirePin("compPin");
+        if(!confirm("Excluir este período fora de serviço? A capacidade dos dias dele volta a contar como completa.")) return;
+        await mgmt({kind:"delete_mixer_outage",id:id},"compPin");
+        setStatus("Período excluído.","oktxt");
+        if(outageEditId===id) clearOutageForm();
+        await loadOverview("componentes");
+      }catch(e){setStatus(e.message,"badtext");}
     }
 
     function fillMixOptions(rows){
@@ -765,10 +961,27 @@
         ?(monthMode?"Cada barra é a média das taxas diárias do mês (m³ por hora com a usina produzindo). ":"m³ por hora com a usina produzindo, calculado dia a dia. ")+"A linha é a média dos dias do período; dias sem produção lançada ficam de fora."
         :"m³ lançados em cada "+unit+". A linha é a média das barras com produção.";
 
+      if(prodView==="lines"){
+        $("prodChartTitle").textContent="Produção por linha, "+unit+" a "+unit;
+        $("prodChartSub").textContent="Volume de cada "+unit+" dividido entre o Misturador A e o B. Dia com um só misturador rodando: a produção é toda dele (exato). Dia com os dois: dividido pelas horas de cada um (aproximado).";
+        renderProdNotes(daily);
+        renderLinesView(data,daily,monthMode,host);
+        return;
+      }
+      $("prodLines").innerHTML="";
+      const capByMonth=new Map();
+      daily.forEach(function(d){
+        if(d.m3_per_running_hour==null || !(d.capacity_m3h>0)) return;
+        const k=d.date.slice(0,7);
+        if(!capByMonth.has(k)) capByMonth.set(k,[]);
+        capByMonth.get(k).push(d.capacity_m3h);
+      });
+      const capOfMonth=function(k){ const a=capByMonth.get(k); return a&&a.length?a.reduce(function(s,v){return s+v;},0)/a.length:null; };
+
       const items=monthMode
         ?(hr.months||[]).map(function(m){
             return {x:fmtMonth(m.month),title:fmtMonth(m.month)+" · "+plural(m.days_counted,"dia","dias")+" com produção",
-              value:rate?m.avg_m3_per_running_hour:m.total_m3,
+              value:rate?m.avg_m3_per_running_hour:m.total_m3,cap:rate?capOfMonth(m.month):null,
               rows:rate
                 ?[["Média m³/h produzindo",fmtRate(m.avg_m3_per_running_hour)],["Média m³/h da jornada",fmtRate(m.avg_m3_per_journey_hour)],["Produção total",fmtM3(m.total_m3)]]
                 :[["Produção total",fmtM3(m.total_m3)],["Média m³/h produzindo",fmtRate(m.avg_m3_per_running_hour)],["Dias com produção",String(m.days_counted)]]};
@@ -776,7 +989,7 @@
         :daily.map(function(d){
             const vol=d.volume_m3;
             return {x:daily.length>12?d.date.slice(8,10):fmtDay(d.date),title:weekdayShort(d.date)+" "+fmtDayFull(d.date),
-              value:rate?d.m3_per_running_hour:(vol>0?vol:null),
+              value:rate?d.m3_per_running_hour:(vol>0?vol:null),cap:rate&&d.capacity_m3h>0?d.capacity_m3h:null,
               rows:rate
                 ?[["m³/h produzindo",fmtRate(d.m3_per_running_hour)],["m³/h da jornada",fmtRate(d.m3_per_journey_hour)],["Produção",vol==null?"não lançada":fmtM3(vol)],["Horas produzindo",fmtShort(d.running_seconds)],["Jornada",fmtShort(d.journey_seconds)]]
                 :[["Produção",vol==null?"não lançada":fmtM3(vol)],["m³/h produzindo",fmtRate(d.m3_per_running_hour)],["Horas produzindo",fmtShort(d.running_seconds)],["Jornada",fmtShort(d.journey_seconds)]]};
@@ -794,7 +1007,8 @@
       const avg=rate&&hr.avg_m3_per_running_hour!=null
         ?hr.avg_m3_per_running_hour
         :valid.reduce(function(s,it){return s+it.value;},0)/valid.length;
-      const sc=niceScale(Math.max(avg,Math.max.apply(null,valid.map(function(it){return it.value;}))));
+      const capVals=valid.map(function(it){return it.cap;}).filter(function(v){return v>0;});
+      const sc=niceScale(Math.max.apply(null,[avg].concat(valid.map(function(it){return it.value;})).concat(capVals)));
       const vals=items.map(function(it){return it.value;});
       const show=pickLabels(vals,10);
       const fmtV=function(v){return rate?fmtRate(v):fmtNum(v,0);};
@@ -807,13 +1021,89 @@
           const color=has?colorOf(v):"var(--border-strong)";
           const rows=it.rows.map(function(r,ri){return {color:ri===0&&has?color:null,label:r[0],value:r[1]};});
           if(has) rows.push({label:"Em relação à média",value:(v>=avg?"+":"−")+fmtNum(Math.abs(v/avg-1)*100,1)+"%"});
-          return {value:has?v:null,color:color,x:it.x,label:show.has(i)?fmtV(v):null,
+          if(has && it.cap>0){
+            rows.push({label:"Capacidade em serviço",value:fmtNum(it.cap,0)+" m³/h"});
+            rows.push({label:"Ritmo ÷ capacidade",value:fmtNum(v/it.cap*100,0)+"%"});
+          }
+          return {value:has?v:null,color:color,mark:has&&it.cap>0?it.cap:null,x:it.x,label:show.has(i)?fmtV(v):null,
             aria:it.title+": "+(has?fmtV(v)+(rate?" m³/h":" m³"):"sem dados"),
             tip:{title:it.title,rows:rows}};
         }),
         ref:{value:avg},
-        legend:[{color:"var(--series-1)",label:"Na média ou acima"},{color:"var(--bar-neutral)",label:"Abaixo da média"},{line:true,label:"Média do período: "+fmtV(avg)+(rate?" m³/h":" m³")}]
+        legend:[{color:"var(--series-1)",label:"Na média ou acima"},{color:"var(--bar-neutral)",label:"Abaixo da média"},{line:true,label:"Média do período: "+fmtV(avg)+(rate?" m³/h":" m³")}].concat(capVals.length?[{mark:true,label:"Capacidade em serviço (manual)"}]:[])
       });
+    }
+
+    // Produção por linha: dia com um só misturador rodando = todo dele (exato); com os dois = pelas horas de cada um (aproximado).
+    function renderLinesView(data,daily,monthMode,host){
+      const pl=data.production_lines||{lines:[],months:[],unattributed_m3:0};
+      const lines=pl.lines||[];
+      const colorOf=function(id){ return lines.findIndex(function(l){return l.motor_id===id;})===0?"var(--series-1)":"var(--series-2)"; };
+      const nameOf=function(id){ const l=lines.find(function(x){return x.motor_id===id;}); return l?l.name:("Canal "+id); };
+      let items;
+      if(monthMode){
+        items=(pl.months||[]).map(function(m){
+          const total=m.volumes.reduce(function(s,v){return s+v.volume_m3;},0);
+          return {x:fmtMonth(m.month),title:fmtMonth(m.month),total:total,
+            parts:m.volumes.map(function(v){return {id:v.motor_id,volume:v.volume_m3,share:total>0?v.volume_m3/total*100:null};}),exact:null};
+        });
+      }else{
+        items=daily.map(function(d){
+          const total=d.lines.reduce(function(s,l){return s+(l.volume_m3||0);},0);
+          return {x:daily.length>12?d.date.slice(8,10):fmtDay(d.date),title:weekdayShort(d.date)+" "+fmtDayFull(d.date),total:total,date:d.date,
+            parts:d.lines.map(function(l){return {id:l.motor_id,volume:l.volume_m3||0,share:l.share_percent,run:l.running_seconds};}),
+            exact:d.lines.length&&d.lines[0].exact};
+        });
+      }
+      const withVol=items.filter(function(it){return it.total>0;});
+      if(!withVol.length){
+        host.innerHTML='<div class="empty-note">Sem produção atribuída a misturadores no período: é preciso ter produção lançada e horas de misturador no mesmo dia.</div>';
+        host._tips=[];
+        $("prodLines").innerHTML="";
+        return;
+      }
+      const sc=niceScale(Math.max.apply(null,withVol.map(function(it){return it.total;})));
+      const vals=items.map(function(it){return it.total>0?it.total:null;});
+      const show=pickLabels(vals,10);
+      columnChart(host,{
+        max:sc.max,ticks:sc.ticks,fmtTick:function(v){return fmtNum(v,0);},plotH:240,
+        cols:items.map(function(it,i){
+          const has=it.total>0;
+          const rows=!has?[{label:"Produção",value:"sem produção atribuída"}]:it.parts.map(function(p){
+            const extra=(p.run!==undefined?" · "+fmtShort(p.run):"");
+            return {color:colorOf(p.id),label:nameOf(p.id),value:fmtNum(p.volume,1)+" m³ · "+(p.share==null?"0%":fmtPct0(p.share))+extra};
+          });
+          if(has && it.exact!==null) rows.push({label:"Divisão",value:it.exact?"exata (só um misturador rodou)":"aproximada (pelas horas de cada)"});
+          if(has) rows.push({label:"Total",value:fmtM3(it.total)});
+          return {value:has?it.total:null,color:"var(--series-1)",x:it.x,label:show.has(i)?fmtNum(it.total,0):null,
+            stack:has?it.parts.map(function(p){return {value:p.volume,color:colorOf(p.id)};}):null,
+            aria:it.title+": "+(has?fmtM3(it.total)+" — "+it.parts.map(function(p){return nameOf(p.id)+" "+fmtNum(p.volume,1)+" m³";}).join(", "):"sem produção atribuída"),
+            tip:{title:it.title,rows:rows}};
+        }),
+        legend:lines.map(function(l){return {color:colorOf(l.motor_id),label:l.name};}).concat([{text:"Volume em m³"}])
+      });
+
+      const cards=lines.map(function(l){
+        const use=(l.avg_m3_per_running_hour!=null && l.capacity_m3h>0)?l.avg_m3_per_running_hour/l.capacity_m3h*100:null;
+        return '<article class="card kpi line-card"><span><i class="line-key" style="background-color:'+colorOf(l.motor_id)+'"></i>'+esc(l.name)+'</span>'+
+          '<strong>'+esc(fmtM3(l.total_m3))+'</strong>'+
+          '<small>'+esc(fmtPct(l.share_percent))+' da produção atribuída · '+esc(fmtShort(l.running_seconds))+' rodando</small>'+
+          '<small>Ritmo médio '+(l.avg_m3_per_running_hour==null?"N/D":esc(fmtRate(l.avg_m3_per_running_hour))+" m³/h")+' · manual: '+esc(fmtNum(l.capacity_m3h,0))+' m³/h'+(use==null?'':' ('+esc(fmtNum(use,0))+'%)')+'</small>'+
+          '<small>Divisão exata em '+plural(l.exact_days,"dia","dias")+' · aproximada em '+plural(l.approx_days,"dia","dias")+'</small></article>';
+      }).join("");
+      const un=pl.unattributed_m3>0
+        ?'<div class="notice" style="margin-top:12px"><span class="ico">ℹ</span><div><b>'+esc(fmtM3(pl.unattributed_m3))+' sem linha definida.</b> São dias com produção lançada, mas sem horas de misturador detectadas.</div></div>':"";
+      $("prodLines").innerHTML='<section class="kpi-grid">'+cards+'</section>'+un;
+
+      if(!monthMode){
+        const rowsT=items.filter(function(it){return it.total>0;}).map(function(it){
+          return [fmtDayFull(it.date),fmtNum(it.total,1)].concat(it.parts.map(function(p){return fmtNum(p.volume,1)+" ("+(p.share==null?"0":fmtNum(p.share,0))+"%)";})).concat([it.exact?"exata":"aproximada"]);
+        });
+        $("prodDaily").innerHTML=tableTwin("tbl-lines","Ver por linha como tabela",["Data","Produção (m³)"].concat(lines.map(function(l){return l.name+" (m³)";})).concat(["Divisão"]),rowsT,1);
+      }else{
+        $("prodDaily").innerHTML=tableTwin("tbl-lines","Ver por linha como tabela",["Mês"].concat(lines.map(function(l){return l.name+" (m³)";})),
+          (pl.months||[]).map(function(m){return [fmtMonth(m.month)].concat(m.volumes.map(function(v){return fmtNum(v.volume_m3,1);}));}),1);
+      }
     }
 
     function renderProdNotes(daily){
@@ -959,6 +1249,303 @@
       }catch(e){setStatus(e.message,"badtext");}
     }
 
+    // ---------- Relatório em PDF, no formato da Torre de Controle (3 páginas A4 paisagem) ----------
+    const LOGO_PNG="data:image/png;base64,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";
+    const TORRE={disp:"#0070C0",prod:"#1F497D",indisp:"#A6A6A6",loss:"#953735",green:"#00B050",red:"#C00000",yellow:"#FFC000",band:"#1D2F7B",navy:"#002060"};
+
+    function addDays(dateStr,n){
+      const d=new Date(dateStr+"T12:00:00Z");
+      d.setUTCDate(d.getUTCDate()+n);
+      return d.toISOString().slice(0,10);
+    }
+    function isoWeek(dateStr){
+      const d=new Date(dateStr+"T12:00:00Z");
+      d.setUTCDate(d.getUTCDate()-((d.getUTCDay()+6)%7)+3);
+      const jan4=new Date(Date.UTC(d.getUTCFullYear(),0,4));
+      return 1+Math.round(((d-jan4)/86400000-3+((jan4.getUTCDay()+6)%7))/7);
+    }
+
+    function svgText(x,y,txt,o){
+      o=o||{};
+      return '<text x="'+x+'" y="'+y+'" font-size="'+(o.size||12)+'" fill="'+(o.fill||"#262626")+'"'+(o.bold?' font-weight="700"':'')+
+        (o.anchor?' text-anchor="'+o.anchor+'"':'')+(o.rotate?' transform="rotate('+o.rotate+' '+x+' '+y+')"':'')+'>'+esc(txt)+'</text>';
+    }
+    function badge(cx,y,txt,bg,fg){
+      const w=Math.max(34,txt.length*7+10);
+      return '<rect x="'+(cx-w/2).toFixed(1)+'" y="'+y.toFixed(1)+'" width="'+w+'" height="18" rx="2" fill="'+bg+'"/>'+svgText(cx.toFixed(1),(y+13).toFixed(1),txt,{size:11,bold:true,fill:fg,anchor:"middle"});
+    }
+    function polyline(pts,color,dash,width){
+      // Quebra a linha onde não há dado, para não ligar semanas sem operação.
+      let out="", seg=[];
+      const flush=function(){
+        if(seg.length>1) out+='<polyline points="'+seg.map(function(p){return p[0].toFixed(1)+","+p[1].toFixed(1);}).join(" ")+'" fill="none" stroke="'+color+'" stroke-width="'+(width||2.5)+'"'+(dash?' stroke-dasharray="'+dash+'"':'')+' stroke-linejoin="round"/>';
+        seg=[];
+      };
+      pts.forEach(function(p){ if(p===null) flush(); else seg.push(p); });
+      flush();
+      return out;
+    }
+    function dots(pts,color){
+      return pts.filter(Boolean).map(function(p){return '<circle cx="'+p[0].toFixed(1)+'" cy="'+p[1].toFixed(1)+'" r="4" fill="'+color+'" stroke="#fff" stroke-width="1.5"/>';}).join("");
+    }
+    function legendRow(items,y){
+      const widths=items.map(function(it){return (it.kind==="text"?8:30)+it.label.length*6.1;});
+      const total=widths.reduce(function(s,w){return s+w;},0)+(items.length-1)*14;
+      let x=561.5-total/2, out="";
+      items.forEach(function(it,i){
+        if(it.kind==="text"){ out+=svgText(x.toFixed(1),y+4,it.label,{size:10.5,fill:"#595959"}); x+=widths[i]+14; return; }
+        if(it.kind==="box") out+='<rect x="'+x.toFixed(1)+'" y="'+(y-5)+'" width="16" height="9" fill="'+it.color+'"/>';
+        else if(it.kind==="miss") out+='<rect x="'+x.toFixed(1)+'" y="'+(y-5)+'" width="16" height="9" fill="'+it.color+'" fill-opacity=".55" stroke="'+it.color+'"/>';
+        else{
+          out+='<line x1="'+x.toFixed(1)+'" x2="'+(x+18).toFixed(1)+'" y1="'+y+'" y2="'+y+'" stroke="'+it.color+'" stroke-width="2.5"'+(it.kind==="dash"?' stroke-dasharray="5 3"':'')+(it.kind==="goal"?' stroke-dasharray="2 3" stroke-width="2"':'')+'/>';
+          if(it.kind!=="goal") out+='<circle cx="'+(x+9).toFixed(1)+'" cy="'+y+'" r="3.2" fill="'+it.color+'"/>';
+        }
+        out+=svgText((x+22).toFixed(1),y+4,it.label,{size:10.5,fill:"#404040"});
+        x+=widths[i]+14;
+      });
+      return out;
+    }
+
+    function reportShell(inner,pageNo,pages,genText){
+      return '<section class="print-page"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1123 794" preserveAspectRatio="xMidYMid meet" font-family="Inter,Arial,Helvetica,sans-serif">'+
+        '<rect width="1123" height="794" fill="#fff"/>'+
+        '<rect x="34" y="62" width="1055" height="58" fill="'+TORRE.band+'"/>'+
+        svgText(561.5,100,"INDICADORES USINA",{size:26,bold:true,fill:"#fff",anchor:"middle"})+
+        '<image href="'+LOGO_PNG+'" x="936" y="63" width="140" height="56" preserveAspectRatio="xMidYMid meet"/>'+
+        inner+
+        svgText(48,772,genText,{size:9.5,fill:"#8C8C8C"})+svgText(1075,772,"Página "+pageNo+" de "+pages,{size:9.5,fill:"#8C8C8C",anchor:"end"})+
+        '</svg></section>';
+    }
+
+    function reportSubheader(startDay,endDay,w1,w2){
+      return svgText(48,162,"Semana:",{size:14,bold:true})+svgText(118,162,fmtDayFull(startDay),{size:14,bold:true})+
+        svgText(236,162,"até",{size:14,bold:true})+svgText(272,162,fmtDayFull(endDay),{size:14,bold:true})+
+        svgText(470,162,"Número Semana:",{size:14,bold:true})+svgText(600,162,String(w1),{size:14,bold:true})+
+        svgText(648,162,"até",{size:14,bold:true})+svgText(684,162,String(w2),{size:14,bold:true});
+    }
+
+    // Escala com 4 intervalos e passos redondos (inteiros ou .5), para o eixo do PDF.
+    function axis4(maxV){
+      if(!(maxV>0)) return {max:4,ticks:[0,1,2,3,4],step:1};
+      const need=maxV*1.06/4;
+      const exp=Math.pow(10,Math.floor(Math.log10(need)));
+      const steps=[1,2,2.5,3,4,5,6,8,10];
+      let step=10*exp;
+      for(let i=0;i<steps.length;i++){ if(steps[i]*exp>=need){ step=steps[i]*exp; break; } }
+      return {max:step*4,ticks:[0,step,step*2,step*3,step*4],step:step};
+    }
+    function axisDigits(sc){ return sc.step<1?2:(sc.step%1===0?0:1); }
+
+    // Eixos e grade: a escala da esquerda e a da direita têm 4 intervalos, então a grade serve às duas.
+    function reportAxes(G,leftSc,fmtL,rightSc,fmtR,leftTitle,rightTitle){
+      let out="";
+      leftSc.ticks.forEach(function(t,i){
+        const y=G.B-(G.B-G.T)*i/4;
+        if(i>0) out+='<line x1="'+G.L+'" x2="'+G.R+'" y1="'+y.toFixed(1)+'" y2="'+y.toFixed(1)+'" stroke="#D9D9D9" stroke-dasharray="4 4"/>';
+        out+=svgText(G.L-9,(y+4).toFixed(1),fmtL(t),{size:12,fill:"#595959",anchor:"end"});
+        out+=svgText(G.R+9,(y+4).toFixed(1),fmtR(rightSc.ticks[i]),{size:12,fill:"#595959"});
+      });
+      out+='<line x1="'+G.L+'" x2="'+G.R+'" y1="'+G.B+'" y2="'+G.B+'" stroke="#A6A6A6"/>';
+      out+=svgText(G.L-9,G.T-14,leftTitle,{size:11,bold:true,fill:"#595959",anchor:"end"})+svgText(G.R+9,G.T-14,rightTitle,{size:11,bold:true,fill:"#595959"});
+      return out;
+    }
+
+    function barValue(x,w,yTop,yBase,txt,tight){
+      const h=yBase-yTop;
+      if(w<27){
+        return h>=30?svgText((x+w/2+4).toFixed(1),(yBase-5).toFixed(1),txt,{size:9.5,bold:true,fill:"#fff",rotate:-90}):"";
+      }
+      if(h>=17) return svgText((x+w/2).toFixed(1),(yBase-6).toFixed(1),txt,{size:11,bold:true,fill:"#fff",anchor:"middle"});
+      return svgText((x+w/2).toFixed(1),(yTop-4).toFixed(1),txt,{size:11,bold:true,fill:"#262626",anchor:"middle"});
+    }
+
+    function weeksPage1(weeks,targets,hdr,pageNo,pages,genText){
+      const G={L:92,R:1031,T:240,B:600};
+      const n=weeks.length, gw=(G.R-G.L)/n;
+      const sc=axis4(Math.max.apply(null,weeks.map(function(w){return Math.max(w.hAvail,w.hProd,w.hUnav,w.hLoss);}).concat([0])));
+      const rsc={max:100,ticks:[0,25,50,75,100]};
+      const yH=function(v){return G.B-v/sc.max*(G.B-G.T);};
+      const yP=function(p){return G.B-p/100*(G.B-G.T);};
+      const bw=Math.min(46,gw/6.2);
+      let out=hdr+svgText(561.5,206,"Eficiência da Usina",{size:21,bold:true,fill:"#1F497D",anchor:"middle"});
+      out+=reportAxes(G,sc,function(v){return fmtNum(v,axisDigits(sc));},rsc,function(v){return fmtPct(v);},"Horas","%");
+      const series=[["hAvail",TORRE.disp],["hProd",TORRE.prod],["hUnav",TORRE.indisp],["hLoss",TORRE.loss]];
+      const ptsA=[], ptsE=[];
+      weeks.forEach(function(w,i){
+        const cx=G.L+gw*(i+.5), x0=cx-(bw*4+6)/2;
+        if(w.empty) out+=svgText(cx.toFixed(1),G.B-9,"sem operação",{size:11,fill:"#A6A6A6",anchor:"middle"});
+        else series.forEach(function(s,k){
+          const v=w[s[0]], x=x0+k*(bw+2), y=yH(v);
+          out+='<rect x="'+x.toFixed(1)+'" y="'+y.toFixed(1)+'" width="'+bw.toFixed(1)+'" height="'+Math.max(0,G.B-y).toFixed(1)+'" fill="'+s[1]+'"/>';
+          out+=barValue(x,bw,y,G.B,fmtNum(v,1));
+        });
+        out+=svgText(cx.toFixed(1),G.B+22,w.label,{size:13,bold:true,fill:"#404040",anchor:"middle"})+svgText(cx.toFixed(1),G.B+38,w.range,{size:10.5,fill:"#7F7F7F",anchor:"middle"});
+        ptsA.push(w.avail==null?null:[cx,yP(w.avail)]);
+        ptsE.push(w.eff==null?null:[cx,yP(w.eff)]);
+      });
+      // Metas: linhas pontilhadas, na cor de cada indicador.
+      const tA=targets.availability_percent, tE=targets.efficiency_percent;
+      const hasA=tA!==null && tA!==undefined, hasE=tE!==null && tE!==undefined;
+      const yA=hasA?yP(tA):null, yE=hasE?yP(tE):null;
+      if(hasA){
+        out+='<line x1="'+G.L+'" x2="'+G.R+'" y1="'+yA.toFixed(1)+'" y2="'+yA.toFixed(1)+'" stroke="'+TORRE.green+'" stroke-width="1.6" stroke-dasharray="2 4"/>';
+      }
+      if(hasE){
+        out+='<line x1="'+G.L+'" x2="'+G.R+'" y1="'+yE.toFixed(1)+'" y2="'+yE.toFixed(1)+'" stroke="'+TORRE.red+'" stroke-width="1.6" stroke-dasharray="2 4"/>';
+      }
+      out+=polyline(ptsA,TORRE.green,null,2.6)+polyline(ptsE,TORRE.red,"7 5",2.6)+dots(ptsA,TORRE.green)+dots(ptsE,TORRE.red);
+      weeks.forEach(function(w,i){
+        const pa=ptsA[i], pe=ptsE[i];
+        const aboveA=!pa||!pe||w.avail>=w.eff;
+        const put=function(p,v,t,color,above){
+          if(!p) return "";
+          const miss=t!==null && t!==undefined && v<t;
+          let y=above?p[1]-27:p[1]+9;
+          y=Math.max(G.T-2,Math.min(G.B-20,y));
+          return badge(p[0],y,fmtPct(v)+(miss?" ▼":""),color,"#fff");
+        };
+        out+=put(pa,w.avail,tA,TORRE.green,aboveA)+put(pe,w.eff,tE,TORRE.red,!aboveA);
+      });
+      out+=legendRow([{kind:"box",color:TORRE.disp,label:"h Disponível"},{kind:"box",color:TORRE.prod,label:"h Produzindo"},{kind:"box",color:TORRE.indisp,label:"h Indisponível"},
+        {kind:"box",color:TORRE.loss,label:"h Perda Eficiência"},{kind:"line",color:TORRE.green,label:"Disponibilidade"},{kind:"dash",color:TORRE.red,label:"Eficiência"}],688);
+      const goals=[];
+      if(hasA) goals.push({kind:"goal",color:TORRE.green,label:"Meta disponibilidade "+fmtPct(tA)});
+      if(hasE) goals.push({kind:"goal",color:TORRE.red,label:"Meta eficiência "+fmtPct(tE)});
+      if(goals.length) out+=legendRow(goals.concat([{kind:"text",label:"▼ = semana abaixo da meta"}]),712);
+      return reportShell(out,pageNo,pages,genText);
+    }
+
+    function weeksPage2(weeks,hdr,pageNo,pages,genText){
+      const G={L:92,R:1031,T:240,B:600};
+      const n=weeks.length, gw=(G.R-G.L)/n;
+      const sc=axis4(Math.max.apply(null,weeks.map(function(w){return w.volume||0;}).concat([0])));
+      const rsc=axis4(Math.max.apply(null,weeks.map(function(w){return Math.max(w.rate||0,w.cap||0);}).concat([0])));
+      const yV=function(v){return G.B-v/sc.max*(G.B-G.T);};
+      const yR=function(v){return G.B-v/rsc.max*(G.B-G.T);};
+      const bw=Math.min(92,gw*.42);
+      let out=hdr+svgText(561.5,206,"Ritmo de Produção",{size:21,bold:true,fill:"#1F497D",anchor:"middle"});
+      out+=reportAxes(G,sc,function(v){return fmtNum(v,axisDigits(sc));},rsc,function(v){return fmtNum(v,axisDigits(rsc));},"Volume (m³)","m³/h");
+      const ptsR=[], ptsC=[];
+      weeks.forEach(function(w,i){
+        const cx=G.L+gw*(i+.5);
+        if(w.empty || w.volume===null || w.volume===undefined){
+          out+=svgText(cx.toFixed(1),G.B-9,w.empty?"sem operação":"sem produção lançada",{size:11,fill:"#A6A6A6",anchor:"middle"});
+        }else{
+          const y=yV(w.volume);
+          out+='<rect x="'+(cx-bw/2).toFixed(1)+'" y="'+y.toFixed(1)+'" width="'+bw.toFixed(1)+'" height="'+Math.max(0,G.B-y).toFixed(1)+'" fill="'+TORRE.prod+'"/>';
+          out+=barValue(cx-bw/2,bw,y,G.B,fmtNum(w.volume,0));
+        }
+        out+=svgText(cx.toFixed(1),G.B+22,w.label,{size:13,bold:true,fill:"#404040",anchor:"middle"})+svgText(cx.toFixed(1),G.B+38,w.range,{size:10.5,fill:"#7F7F7F",anchor:"middle"});
+        ptsR.push(w.rate==null?null:[cx,yR(w.rate)]);
+        ptsC.push(w.cap==null?null:[cx,yR(w.cap)]);
+      });
+      out+=polyline(ptsC,"#000",null,2.6)+polyline(ptsR,TORRE.yellow,"7 5",2.6)+dots(ptsC,"#000")+dots(ptsR,TORRE.yellow);
+      weeks.forEach(function(w,i){
+        const pr=ptsR[i], pc=ptsC[i];
+        const capAbove=!pr||!pc||w.cap>=w.rate;
+        const put=function(p,txt,bg,fg,above){
+          if(!p) return "";
+          let y=above?p[1]-27:p[1]+9;
+          y=Math.max(G.T-2,Math.min(G.B-20,y));
+          return badge(p[0],y,txt,bg,fg);
+        };
+        out+=put(pc,fmtNum(w.cap,1),"#000","#fff",capAbove)+put(pr,fmtNum(w.rate,0),TORRE.yellow,"#000",!capAbove);
+      });
+      out+=legendRow([{kind:"box",color:TORRE.prod,label:"Volume (m³)"},{kind:"dash",color:TORRE.yellow,label:"Ritmo (m³/h)"},{kind:"line",color:"#000",label:"Capacidade (m³/h)"}],690);
+      out+=svgText(561.5,722,"Ritmo = média das taxas diárias (m³ ÷ horas produzindo). Capacidade = capacidade em serviço pelo manual (100 m³/h por misturador, descontados os dias fora de serviço).",{size:10,fill:"#7F7F7F",anchor:"middle"});
+      return reportShell(out,pageNo,pages,genText);
+    }
+
+    function legendPage(reasons,targets,pageNo,pages,genText){
+      const groups={efficiency:[],unclassified:[],excluded:[],unavailability:[]};
+      reasons.forEach(function(r){
+        if(r.reason_code==="UNCLASSIFIED") return;
+        const g=reasonGroup(r);
+        if(groups[g]) groups[g].push(r);
+      });
+      const rows=[{name:"Produzindo",a:"sim",e:"sim",cat:"Produtivo",fill:"#C5D9F1"}];
+      groups.efficiency.forEach(function(r){rows.push({name:r.label,a:"sim",e:"não",cat:"Perda Eficiência",fill:"#fff"});});
+      rows.push({name:"Parada sem motivo",a:"sim",e:"não",cat:"Perda Eficiência (até classificar)",fill:"#fff"});
+      groups.excluded.forEach(function(r){rows.push({name:r.label,a:"—",e:"—",cat:"Fora da jornada",fill:"#F2F2F2"});});
+      groups.unavailability.forEach(function(r){rows.push({name:r.label,a:"não",e:"não",cat:PLANNED_CODES.has(r.reason_code)?"Indisponível (programada)":"Indisponível",fill:"#E6B8B7"});});
+      const X=130, W=863, top=168;
+      const rowH=Math.min(23,(620-top-66)/rows.length);
+      const cw=[.46,.14,.14,.26].map(function(f){return f*W;});
+      const cx=[X,X+cw[0],X+cw[0]+cw[1],X+cw[0]+cw[1]+cw[2]];
+      let out='<rect x="'+X+'" y="'+top+'" width="'+W+'" height="36" fill="'+TORRE.navy+'"/>'+svgText(X+W/2,top+24,"LEGENDA DE EFICIÊNCIA DA USINA",{size:18,bold:true,fill:"#fff",anchor:"middle"});
+      const hy=top+36;
+      out+='<rect x="'+X+'" y="'+hy+'" width="'+W+'" height="28" fill="#fff" stroke="#000"/>';
+      ["Legenda de Eficiência","Disponível?","Eficiente?","Categoria"].forEach(function(h,i){
+        out+=svgText((cx[i]+cw[i]/2).toFixed(1),hy+19,h,{size:12,bold:true,fill:"#595959",anchor:"middle"});
+      });
+      rows.forEach(function(r,i){
+        const y=hy+28+i*rowH;
+        out+='<rect x="'+X+'" y="'+y.toFixed(1)+'" width="'+W+'" height="'+rowH.toFixed(1)+'" fill="'+r.fill+'" stroke="#000" stroke-width=".8"/>';
+        [r.name,r.a,r.e,r.cat].forEach(function(t,k){
+          out+=svgText((cx[k]+cw[k]/2).toFixed(1),(y+rowH/2+4).toFixed(1),t,{size:Math.min(12,rowH*.55),anchor:"middle"});
+        });
+      });
+      for(let k=1;k<4;k++) out+='<line x1="'+cx[k].toFixed(1)+'" x2="'+cx[k].toFixed(1)+'" y1="'+hy+'" y2="'+(hy+28+rows.length*rowH).toFixed(1)+'" stroke="#000" stroke-width=".8"/>';
+      let y=hy+28+rows.length*rowH+30;
+      const notes=["Disponibilidade = (jornada − indisponibilidade) ÷ jornada.   Eficiência = horas produzindo ÷ (jornada − indisponibilidade).",
+        "Fora da jornada (refeição, DDS, Setup e Sem operação) não entra em nenhum indicador.",
+        "Semanas de segunda a domingo (numeração ISO). Ritmo = média das taxas diárias; Capacidade = capacidade em serviço pelo manual."];
+      const tA=targets.availability_percent, tE=targets.efficiency_percent;
+      if((tA!==null&&tA!==undefined)||(tE!==null&&tE!==undefined))
+        notes.push("Metas: "+[(tA!==null&&tA!==undefined)?"disponibilidade "+fmtPct(tA):null,(tE!==null&&tE!==undefined)?"eficiência "+fmtPct(tE):null].filter(Boolean).join(" · ")+".  ▼ marca a semana abaixo da meta.");
+      notes.forEach(function(t){ out+=svgText(X,y,t,{size:10.5,fill:"#595959"}); y+=16; });
+      return reportShell(out,pageNo,pages,genText);
+    }
+
+    function buildReportPages(data,firstMon,lastMon,endSun){
+      const buckets=new Map(((data.trend||{}).buckets||[]).map(function(b){return [b.key,b];}));
+      const weeks=[];
+      for(let mon=firstMon; mon<=lastMon; mon=addDays(mon,7)){
+        const b=buckets.get(mon)||null;
+        const J=b?b.journey_seconds:0, U=b?b.unavailability_seconds:0;
+        weeks.push({
+          label:"S "+isoWeek(mon), range:fmtDay(mon)+" a "+fmtDay(addDays(mon,6)), mon:mon, empty:!(J>0),
+          hAvail:Math.max(0,(J-U))/3600, hProd:(b?b.running_seconds:0)/3600, hUnav:U/3600, hLoss:(b?b.efficiency_loss_seconds:0)/3600,
+          avail:b?b.availability_percent:null, eff:b?b.efficiency_percent:null,
+          volume:b&&b.volume_m3!=null?b.volume_m3:null, rate:b?b.m3_per_running_hour:null, cap:b?b.capacity_m3h:null
+        });
+      }
+      const t=data.targets||{};
+      const w1=weeks[0].label.slice(2), w2=weeks[weeks.length-1].label.slice(2);
+      const hdr=reportSubheader(firstMon,endSun,w1,w2);
+      const gen="Gerado em "+new Date().toLocaleString("pt-BR",{timeZone:TZ})+" · UC 0012 · Usina Pitanga · dados HF-006/Supabase";
+      return {html:weeksPage1(weeks,t,hdr,1,3,gen)+weeksPage2(weeks,hdr,2,3,gen)+legendPage(data.reasons||[],t,3,3,gen),w1:w1,w2:w2,weeks:weeks};
+    }
+
+    async function generatePdf(){
+      const btn=$("printBtn"), info=$("printInfo");
+      try{
+        const endDay=$("printEnd").value||localDate();
+        const n=Math.max(1,Math.min(12,Number($("printWeeks").value)||4));
+        const lastMon=mondayOf(endDay), firstMon=addDays(lastMon,-7*(n-1)), endSun=sundayOf(endDay);
+        btn.disabled=true;
+        info.textContent="Montando o relatório...";
+        const data=await mgmt({kind:"overview",start:firstMon,end:endSun,compact:true,granularity:"week"},null);
+        const rep=buildReportPages(data,firstMon,lastMon,endSun);
+        $("printRoot").innerHTML=rep.html;
+        const prevTitle=document.title;
+        document.title="UC0012 - Indicadores Usina - S"+rep.w1+" a S"+rep.w2;
+        document.body.classList.add("printing");
+        const done=function(){
+          document.body.classList.remove("printing");
+          document.title=prevTitle;
+          window.removeEventListener("afterprint",done);
+        };
+        window.addEventListener("afterprint",done);
+        info.textContent="Semanas "+rep.w1+" a "+rep.w2+" ("+fmtDayFull(firstMon)+" a "+fmtDayFull(endSun)+"). Na janela de impressão, escolha “Salvar como PDF”. Se ela não abrir, use Ctrl+P: o relatório já está montado.";
+        setTimeout(function(){ window.print(); },80);
+      }catch(e){
+        info.textContent="Erro ao montar o relatório: "+e.message;
+      }finally{
+        btn.disabled=false;
+      }
+    }
+
     function switchTab(name){
       activeTab=name;
       hideTip();
@@ -1006,12 +1593,18 @@
     $("saveProduction").addEventListener("click",saveProduction);
     $("cancelProductionEdit").addEventListener("click",clearProductionForm);
     $("saveTargets").addEventListener("click",saveTargets);
+    $("saveOutage").addEventListener("click",saveOutage);
+    $("cancelOutageEdit").addEventListener("click",clearOutageForm);
+    $("printBtn").addEventListener("click",generatePdf);
     ["targetAvail","targetEff"].forEach(function(id){
       $(id).addEventListener("input",function(){ $(id).dataset.dirty="1"; });
     });
     // A aba Metas usa o PIN da Gestão: os dois campos acompanham um ao outro.
-    [["gestaoPin","metaPin"],["metaPin","gestaoPin"]].forEach(function(p){
-      $(p[0]).addEventListener("input",function(){ $(p[1]).value=$(p[0]).value; });
+    // O PIN da Gestão também vale para declarar misturador fora de serviço (aba Componentes).
+    ["gestaoPin","metaPin","compPin"].forEach(function(id){
+      $(id).addEventListener("input",function(){
+        ["gestaoPin","metaPin","compPin"].forEach(function(other){ if(other!==id) $(other).value=$(id).value; });
+      });
     });
 
     updateThemeBtn();
@@ -1022,6 +1615,7 @@
       $(SCOPES[scope].end).value=today;
     });
     $("productionDate").value=today;
+    $("printEnd").value=today;
     await Promise.all([loadLive(),loadOverview("gestao")]);
     setInterval(loadLive,5000);
     setInterval(function(){
@@ -1344,6 +1938,51 @@
     .classif-card p{margin:0 0 12px}
     .classif-card ul{margin:0;padding-left:18px;font-size:13px;line-height:1.7;color:var(--text-2)}
 
+
+    /* Metas nos gráficos, marcas de referência e colunas empilhadas */
+    .viz-bar.miss{background-image:repeating-linear-gradient(135deg,transparent 0 3px,color-mix(in srgb,var(--surface) 62%,transparent) 3px 5px)}
+    .viz-bar.stack{display:flex;flex-direction:column-reverse;overflow:hidden}
+    .viz-seg{display:block;width:100%;flex:none}
+    .viz-seg+.viz-seg{border-bottom:2px solid var(--surface)}
+    .viz-mark{position:absolute;left:50%;width:100%;max-width:24px;height:3px;transform:translate(-50%,50%);background:var(--text);box-shadow:0 0 0 1px var(--surface);border-radius:1px;pointer-events:none;z-index:1}
+    .viz-legend i.miss{background-image:repeating-linear-gradient(135deg,transparent 0 3px,color-mix(in srgb,var(--surface) 62%,transparent) 3px 5px)}
+    .viz-legend i.mark{width:14px;height:3px;border-radius:1px;background:var(--text)}
+    .viz-legend .txt{color:var(--muted)}
+
+    /* Capacidade (aba Componentes) */
+    .mixer-card h3,.outage-card h3,.print-card h3{margin:0 0 4px;font-size:16px;font-weight:700}
+    .mixer-card>p,.outage-card>p,.print-card p{margin:0}
+    .mixer-list{display:grid;gap:12px;margin-top:14px}
+    .mixer-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;align-items:center;padding:12px 14px;border:1px solid var(--border);border-radius:var(--radius-sm);background:var(--surface-2)}
+    .mixer-row strong{font-size:15px}
+    .mixer-row small{display:block;margin-top:2px;color:var(--muted);font-size:12px}
+    .mixer-meta{grid-column:1 / -1;font-size:12px;color:var(--text-2)}
+    .mixer-meta.warn{color:var(--warn-text);font-weight:600}
+    .outage-card{margin-top:14px}
+    .outage-form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-top:12px}
+    .outage-table{margin-top:16px}
+    .outage-table table{min-width:640px}
+    .line-card .line-key{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:7px}
+    #prodLines{margin-top:14px}
+    #prodLines .kpi-grid{grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+    .print-card{margin-top:14px}
+    .print-row{display:flex;justify-content:space-between;gap:16px;align-items:flex-end;flex-wrap:wrap}
+    .print-row .filters{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
+    #printInfo{margin-top:8px;min-height:1em}
+
+    /* Impressão: só o relatório, em páginas A4 paisagem */
+    #printRoot{display:none}
+    @media print{
+      @page{size:A4 landscape;margin:0}
+      html,body{background:#fff!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+      body.printing .wrap{display:none!important}
+      body.printing #printRoot{display:block}
+      .viz-tip{display:none!important}
+      .print-page{width:297mm;height:209.5mm;overflow:hidden;background:#fff;break-after:page;page-break-after:always}
+      .print-page:last-child{break-after:auto;page-break-after:auto}
+      .print-page svg{display:block;width:100%;height:100%}
+    }
+
     @media (max-width:1000px){
       .indicator-grid{grid-template-columns:1fr}
     }
@@ -1417,6 +2056,19 @@
       </div>
       <div id="managementLoading" class="management-status">Carregando...</div>
     </article>
+
+    <article class="card print-card">
+      <div class="print-row">
+        <div><h3>Relatório em PDF</h3><p class="muted">Indicadores da usina por semana, no formato da Torre de Controle: 3 páginas em A4 paisagem. Na janela de impressão, escolha “Salvar como PDF”.</p></div>
+        <div class="filters">
+          <div class="filter"><label class="small" for="printEnd">Última semana (qualquer dia dela)</label><input id="printEnd" type="date"></div>
+          <div class="filter"><label class="small" for="printWeeks">Semanas</label><select id="printWeeks"><option>2</option><option>3</option><option selected>4</option><option>6</option><option>8</option><option>12</option></select></div>
+          <button id="printBtn" class="primary" type="button">Gerar PDF</button>
+        </div>
+      </div>
+      <div id="printInfo" class="small"></div>
+    </article>
+
 
     <div id="unclassNotice" class="notice hidden" style="margin-top:14px"></div>
 
@@ -1498,6 +2150,39 @@
       </div>
       <div id="compLoading" class="management-status">Carregando...</div>
     </article>
+    <h2 class="section-title">Disponibilidade por capacidade</h2>
+    <div class="small" style="margin-bottom:12px">Cada misturador vale a sua fatia da capacidade nominal (manual: 100 m³/h cada, 200 m³/h com os dois). Com um misturador fora de serviço o dia todo, a disponibilidade do período cai para a fatia que sobrou. Mostra o efeito real da falta de um misturador, mas só faz sentido se a demanda exige os dois. A disponibilidade mecânica da aba Gestão continua igual.</div>
+    <section id="capGrid" class="indicator-grid"><div class="card empty">Carregando...</div></section>
+    <section id="capTrendSection" class="hidden" style="margin-top:14px">
+      <article class="card"><div class="chart-head"><div><h3 id="capChartTitle">Disponibilidade por capacidade</h3><p id="capChartSub" class="muted"></p></div></div><div id="capChart" class="viz-host"></div></article>
+      <div id="capTable"></div>
+    </section>
+
+    <article id="outageCard" class="card outage-card">
+      <h3 id="outageFormTitle">Misturador fora de serviço</h3>
+      <p class="muted">Declare o período em que um misturador esteve parado. Só os dias declarados reduzem a capacidade; um misturador parado por falta de pedido não conta como fora de serviço. A data final é o último dia fora de serviço: deixe em branco enquanto continuar parado.</p>
+      <div class="filter" style="margin-top:12px;max-width:190px"><label class="small" for="compPin">PIN da gestão</label><input id="compPin" class="pin-input" type="password" autocomplete="off" placeholder="PIN"></div>
+      <div class="outage-form-grid">
+        <div class="filter"><label class="small" for="outageMotor">Misturador</label><select id="outageMotor"></select></div>
+        <div class="filter"><label class="small" for="outageStart">Fora de serviço desde</label><input id="outageStart" type="date"></div>
+        <div class="filter"><label class="small" for="outageEnd">Até (em branco = em aberto)</label><input id="outageEnd" type="date"></div>
+        <div class="filter"><label class="small" for="outageReason">Motivo</label><select id="outageReason"></select></div>
+        <div class="filter"><label class="small" for="outageNote">Observação</label><input id="outageNote" type="text" placeholder="Opcional"></div>
+      </div>
+      <div class="editor-actions"><button id="saveOutage" class="primary">Salvar período</button><button id="cancelOutageEdit" class="hidden">Cancelar edição</button></div>
+      <div class="card table-card outage-table"><table><thead><tr><th>Misturador</th><th>Desde</th><th>Até</th><th>Motivo</th><th>Observação</th><th>Ações</th></tr></thead><tbody id="outageBody"></tbody></table></div>
+    </article>
+
+    <details class="card how" data-key="how-cap">
+      <summary>Como a capacidade é calculada</summary>
+      <div class="how-body">
+        <p><b>Capacidade nominal</b> = soma dos misturadores (manual: A 100 m³/h + B 100 m³/h = 200 m³/h). Cada um vale a sua fatia, hoje 50% cada.</p>
+        <p><b>Dia a dia</b>, a capacidade em serviço é a fatia dos misturadores que não estão declarados fora de serviço naquele dia.</p>
+        <p><b>Disponibilidade por capacidade</b> = Σ [(jornada − indisponibilidade) × capacidade em serviço] ÷ Σ jornada. Com um misturador fora o período todo e a usina sem quebras, o resultado é 50%.</p>
+        <p>O indicador mostra o efeito real, mas só faz sentido se a demanda exige os dois misturadores. A meta usada é a mesma de disponibilidade, definida na aba Metas.</p>
+      </div>
+    </details>
+
     <h2 class="section-title">Tempo ligado de cada componente</h2>
     <div class="small" style="margin-bottom:12px">Mostra quanto tempo cada componente ficou ligado dentro da jornada do período (sem Refeição e Sem operação). Não é a disponibilidade mecânica da usina, que fica na aba Gestão.</div>
     <section id="componentsGrid" class="components-grid"></section>
@@ -1538,10 +2223,11 @@
         <div class="seg-ctl" role="group" aria-label="O que mostrar no gráfico">
           <button class="seg-btn active" type="button" data-view="rate">m³ por hora</button>
           <button class="seg-btn" type="button" data-view="volume">Volume (m³)</button>
-          <button class="seg-btn" type="button" disabled aria-disabled="true" title="Produção por linha (Misturador A e B): ainda sem forma de medir">Por linha · em breve</button>
+          <button class="seg-btn" type="button" data-view="lines" title="Volume dividido entre o Misturador A e o B">Por linha</button>
         </div>
       </div>
       <div id="prodChart" class="viz-host"></div>
+      <div id="prodLines"></div>
       <div id="prodMissing"></div>
       <div id="prodDaily"></div>
     </article>
@@ -1571,7 +2257,7 @@
   <section id="tab-targets" class="tab-page">
     <article class="card">
       <h3 style="margin:0 0 6px;font-size:16px;font-weight:700">Metas de disponibilidade e eficiência</h3>
-      <p class="muted" style="margin:0 0 16px;max-width:70ch">As metas viram um selo nos indicadores e uma linha de referência nos gráficos da aba Gestão. Deixe um campo em branco para remover a meta.</p>
+      <p class="muted" style="margin:0 0 16px;max-width:70ch">As metas viram um selo nos indicadores, uma linha de referência nos gráficos (colunas abaixo da meta aparecem listradas) e uma linha pontilhada no PDF impresso. A disponibilidade por capacidade da aba Componentes usa a mesma meta de disponibilidade. Deixe um campo em branco para remover a meta.</p>
       <div class="filter" style="margin-bottom:14px;max-width:190px"><label class="small" for="metaPin">PIN da gestão</label><input id="metaPin" class="pin-input" type="password" autocomplete="off" placeholder="PIN"></div>
       <div class="targets-grid">
         <div class="filter"><label class="small" for="targetAvail">Meta de disponibilidade (%)</label><input id="targetAvail" type="number" inputmode="decimal" min="0" max="100" step="0.1" placeholder="Ex.: 95"></div>
@@ -1589,5 +2275,6 @@
 
   <footer class="footer">UC 0012 · dados operacionais preservados na HF-006/Supabase · correções gerenciais auditáveis</footer>
 </main>
+<div id="printRoot" aria-hidden="true"></div>
 </body>
 </html>
