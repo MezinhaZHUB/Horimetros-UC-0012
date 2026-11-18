@@ -335,6 +335,57 @@
       }).join("")+'<span class="small">Não entram na disponibilidade nem na eficiência.</span>';
     }
 
+    // ---------- Motivos das paradas: % do tempo parado ----------
+    let stopReasonsView="ind";
+    const CAT_COLOR={unavailability:"var(--series-2)",efficiency:"var(--series-1)",unclassified:"var(--bar-neutral)",excluded:"color-mix(in srgb,var(--muted) 55%,transparent)"};
+    const CAT_NAME={unavailability:"Indisponibilidade",efficiency:"Perda de eficiência",unclassified:"Sem classificação",excluded:"Fora da jornada"};
+    const CAT_ORDER=["unavailability","efficiency","unclassified","excluded"];
+
+    // Junta os motivos de todas as categorias e calcula a participação de cada um no tempo parado.
+    function stopReasonRows(b,includeExcluded){
+      const list=[].concat(b.unavailability||[],b.efficiency||[],includeExcluded?(b.excluded||[]):[]);
+      const rows=list.filter(function(r){return r.seconds>0;}).map(function(r){
+        return {code:r.reason_code,label:r.label,seconds:r.seconds,count:r.count,category:r.unclassified?"unclassified":r.category};
+      });
+      rows.sort(function(a,c){return c.seconds-a.seconds;});
+      const total=rows.reduce(function(s,r){return s+r.seconds;},0);
+      let cum=0;
+      rows.forEach(function(r){ r.pct=total>0?r.seconds/total*100:0; cum+=r.pct; r.cum=Math.min(100,cum); });
+      const byCat={};
+      rows.forEach(function(r){ byCat[r.category]=(byCat[r.category]||0)+r.seconds; });
+      return {rows:rows,total:total,byCat:byCat};
+    }
+
+    function renderStopReasons(data){
+      const all=stopReasonsView==="all";
+      const R=stopReasonRows(data.breakdown||{},all);
+      $("stopReasonsSub").textContent=all
+        ?"Participação de cada motivo em todo o tempo parado, incluindo o que fica fora da jornada (refeição, DDS, Setup e Sem operação)."
+        :"Participação de cada motivo no tempo parado que entra nos indicadores (indisponibilidade e perda de eficiência). A barra cheia é 100%.";
+      document.querySelectorAll(".seg-btn[data-rview]").forEach(function(b){ b.classList.toggle("active",b.dataset.rview===stopReasonsView); });
+      if(!R.rows.length){
+        $("stopReasonsChart").innerHTML='<div class="empty-note">Nenhuma parada neste período.</div>';
+        $("stopReasonsTable").innerHTML="";
+        return;
+      }
+      const cats=CAT_ORDER.filter(function(c){return R.byCat[c]>0;});
+      const split='<div class="cat-split" role="img" aria-label="'+esc(cats.map(function(c){return CAT_NAME[c]+" "+fmtPct(R.byCat[c]/R.total*100);}).join(", "))+'">'+
+        cats.map(function(c){return '<span style="width:'+(R.byCat[c]/R.total*100).toFixed(2)+'%;background-color:'+CAT_COLOR[c]+'"></span>';}).join("")+'</div>'+
+        '<div class="cat-legend">'+cats.map(function(c){
+          return '<span><i style="background-color:'+CAT_COLOR[c]+'"></i>'+esc(CAT_NAME[c])+' <b>'+esc(fmtPct(R.byCat[c]/R.total*100))+'</b> <small>· '+esc(fmtShort(R.byCat[c]))+'</small></span>';
+        }).join("")+'<span class="txt">Total parado: <b>'+esc(fmtShort(R.total))+'</b></span></div>';
+      const list='<div class="reason-list stop-list">'+R.rows.map(function(r){
+        const tag=PLANNED_CODES.has(r.code)?' <small class="reason-tag">programada</small>':'';
+        return '<div class="reason-row"><span class="reason-name">'+(r.category==="unclassified"?'⚠ ':'')+esc(r.label)+tag+'</span>'+
+          '<span class="reason-track"><span class="reason-bar" style="width:'+Math.max(.4,r.pct).toFixed(2)+'%;background-color:'+CAT_COLOR[r.category]+'"></span></span>'+
+          '<span class="reason-val"><b>'+esc(fmtPct(r.pct))+'</b> <small>· '+esc(fmtShort(r.seconds))+' · acum. '+esc(fmtPct(r.cum))+'</small></span></div>';
+      }).join("")+'</div>';
+      $("stopReasonsChart").innerHTML=split+list;
+      $("stopReasonsTable").innerHTML=tableTwin("tbl-stopreasons","Ver como tabela",
+        ["Motivo","Categoria","Horas","Paradas","% do tempo parado","Acumulado"],
+        R.rows.map(function(r){return [r.label,CAT_NAME[r.category],fmtShort(r.seconds),String(r.count),fmtPct(r.pct),fmtPct(r.cum)];}).concat([["Total","",fmtShort(R.total),String(R.rows.reduce(function(s,r){return s+r.count;},0)),"100,0%",""]]),2);
+    }
+
     function renderTrend(data){
       const tr=data.trend||{}, buckets=tr.buckets||[], gran=tr.granularity||"day";
       const sec=$("trendSection");
@@ -422,6 +473,7 @@
       $("kpiLoss").textContent=fmtShort(L);
       $("kpiProduction").textContent=fmtM3(data.production_summary.total_m3);
 
+      renderStopReasons(data);
       renderTrend(data);
       renderTimeline(data.days||[],tooLong);
       fillReasonOptions(data.reasons||[]);
@@ -1456,6 +1508,44 @@
       return reportShell(out,pageNo,pages,genText);
     }
 
+    function reasonsPage(bd,hdr,periodText,pageNo,pages,genText){
+      const R=stopReasonRows(bd,false);
+      let out=hdr+svgText(561.5,206,"Motivos das Paradas",{size:21,bold:true,fill:"#1F497D",anchor:"middle"});
+      out+=svgText(561.5,226,"% do tempo parado de "+periodText+" (indisponibilidade + perda de eficiência)",{size:11,fill:"#7F7F7F",anchor:"middle"});
+      if(!R.rows.length){
+        out+=svgText(561.5,400,"Nenhuma parada registrada no período.",{size:14,fill:"#7F7F7F",anchor:"middle"});
+        return reportShell(out,pageNo,pages,genText);
+      }
+      const colors={unavailability:TORRE.indisp,efficiency:TORRE.loss,unclassified:"#D99694",other:"#BFBFBF"};
+      let rows=R.rows.slice();
+      if(rows.length>12){
+        const rest=rows.slice(11);
+        rows=rows.slice(0,11).concat([{label:"Demais motivos ("+rest.length+")",seconds:rest.reduce(function(s,r){return s+r.seconds;},0),
+          pct:rest.reduce(function(s,r){return s+r.pct;},0),cum:100,category:"other"}]);
+      }
+      const X0=345, X1=905, top=262, B=600;
+      const rowH=Math.min(44,(B-top)/rows.length), barH=rowH*.6, GB=top+rows.length*rowH;
+      const px=function(p){return X0+(X1-X0)*p/100;};
+      out+=svgText(330,250,"Motivo",{size:11,bold:true,fill:"#595959",anchor:"end"})+svgText(X1+12,250,"% e horas",{size:11,bold:true,fill:"#595959"})+svgText(1078,250,"Acumulado",{size:11,bold:true,fill:"#595959",anchor:"end"});
+      [0,25,50,75,100].forEach(function(t){
+        out+='<line x1="'+px(t).toFixed(1)+'" x2="'+px(t).toFixed(1)+'" y1="'+top+'" y2="'+GB.toFixed(1)+'" stroke="#D9D9D9" stroke-dasharray="4 4"/>'+svgText(px(t).toFixed(1),(GB+18).toFixed(1),t+"%",{size:11,fill:"#595959",anchor:"middle"});
+      });
+      rows.forEach(function(r,i){
+        const y=top+i*rowH+(rowH-barH)/2, cy=top+i*rowH+rowH/2+4;
+        let name=(r.category==="unclassified"?"⚠ ":"")+r.label;
+        if(name.length>46) name=name.slice(0,45)+"…";
+        out+=svgText(330,cy.toFixed(1),name,{size:12,anchor:"end"});
+        out+='<rect x="'+X0+'" y="'+y.toFixed(1)+'" width="'+(X1-X0)+'" height="'+barH.toFixed(1)+'" fill="#F2F2F2"/>';
+        out+='<rect x="'+X0+'" y="'+y.toFixed(1)+'" width="'+Math.max(1.5,px(r.pct)-X0).toFixed(1)+'" height="'+barH.toFixed(1)+'" fill="'+colors[r.category]+'"/>';
+        out+=svgText(X1+12,cy.toFixed(1),fmtPct(r.pct)+"  ·  "+fmtShort(r.seconds),{size:12,bold:true});
+        out+=svgText(1078,cy.toFixed(1),r.category==="other"?"":fmtPct(r.cum),{size:12,fill:"#595959",anchor:"end"});
+      });
+      const cats=["unavailability","efficiency","unclassified"].filter(function(c){return R.byCat[c]>0;});
+      out+=legendRow(cats.map(function(c){return {kind:"box",color:colors[c],label:CAT_NAME[c]+" "+fmtPct(R.byCat[c]/R.total*100)};}),Math.round(GB+56));
+      out+=svgText(561.5,Math.round(GB+84),"Total parado no período: "+fmtShort(R.total)+". Fora da jornada (refeição, DDS, Setup e Sem operação) não entra neste gráfico.",{size:10,fill:"#7F7F7F",anchor:"middle"});
+      return reportShell(out,pageNo,pages,genText);
+    }
+
     function legendPage(reasons,targets,pageNo,pages,genText){
       const groups={efficiency:[],unclassified:[],excluded:[],unavailability:[]};
       reasons.forEach(function(r){
@@ -1514,7 +1604,7 @@
       const w1=weeks[0].label.slice(2), w2=weeks[weeks.length-1].label.slice(2);
       const hdr=reportSubheader(firstMon,endSun,w1,w2);
       const gen="Gerado em "+new Date().toLocaleString("pt-BR",{timeZone:TZ})+" · UC 0012 · Usina Pitanga · dados HF-006/Supabase";
-      return {html:weeksPage1(weeks,t,hdr,1,3,gen)+weeksPage2(weeks,hdr,2,3,gen)+legendPage(data.reasons||[],t,3,3,gen),w1:w1,w2:w2,weeks:weeks};
+      return {html:weeksPage1(weeks,t,hdr,1,4,gen)+weeksPage2(weeks,hdr,2,4,gen)+reasonsPage(data.breakdown||{},hdr,fmtDayFull(firstMon)+" a "+fmtDayFull(endSun),3,4,gen)+legendPage(data.reasons||[],t,4,4,gen),w1:w1,w2:w2,weeks:weeks};
     }
 
     async function generatePdf(){
@@ -1576,6 +1666,12 @@
         prodView=b.dataset.view;
         document.querySelectorAll(".seg-btn[data-view]").forEach(function(x){x.classList.toggle("active",x===b);});
         if(overviews.producao) renderProdChart(overviews.producao);
+      });
+    });
+    document.querySelectorAll(".seg-btn[data-rview]").forEach(function(b){
+      b.addEventListener("click",function(){
+        stopReasonsView=b.dataset.rview;
+        if(overviews.gestao) renderStopReasons(overviews.gestao);
       });
     });
     $("applyGestao").addEventListener("click",function(){setPillsActive("gestao","custom");loadOverview("gestao");});
@@ -1949,6 +2045,27 @@
     .viz-legend i.mark{width:14px;height:3px;border-radius:1px;background:var(--text)}
     .viz-legend .txt{color:var(--muted)}
 
+    /* Motivos das paradas */
+    .stop-card .cat-split{display:flex;height:22px;gap:2px;margin:6px 0 10px;border-radius:7px;overflow:hidden}
+    .stop-card .cat-split span{display:block;min-width:2px}
+    .cat-legend{display:flex;gap:6px 18px;flex-wrap:wrap;margin-bottom:18px;font-size:12px;color:var(--text-2)}
+    .cat-legend span{display:inline-flex;gap:7px;align-items:center}
+    .cat-legend i{display:inline-block;width:12px;height:12px;border-radius:3px}
+    .cat-legend b{color:var(--text);font-variant-numeric:tabular-nums}
+    .cat-legend small{color:var(--muted);font-size:12px}
+    .cat-legend .txt{margin-left:auto;color:var(--muted)}
+    .stop-list{gap:10px}
+    .stop-list .reason-row{grid-template-columns:minmax(130px,34%) minmax(0,1fr) minmax(190px,auto)}
+    .stop-list .reason-track{height:14px;border-radius:4px;background:color-mix(in srgb,var(--text) 7%,transparent)}
+    .stop-list .reason-bar{min-width:2px;border-radius:4px}
+    #stopReasonsTable{margin-top:6px}
+    #stopReasonsTable .how{margin-top:10px}
+    @media (max-width:560px){
+      .stop-list .reason-row{grid-template-columns:minmax(0,1fr) auto;gap:6px 12px}
+      .stop-list .reason-track{grid-column:1 / -1;grid-row:2}
+      .cat-legend .txt{margin-left:0}
+    }
+
     /* Capacidade (aba Componentes) */
     .mixer-card h3,.outage-card h3,.print-card h3{margin:0 0 4px;font-size:16px;font-weight:700}
     .mixer-card>p,.outage-card>p,.print-card p{margin:0}
@@ -2059,7 +2176,7 @@
 
     <article class="card print-card">
       <div class="print-row">
-        <div><h3>Relatório em PDF</h3><p class="muted">Indicadores da usina por semana, no formato da Torre de Controle: 3 páginas em A4 paisagem. Na janela de impressão, escolha “Salvar como PDF”.</p></div>
+        <div><h3>Relatório em PDF</h3><p class="muted">Indicadores da usina por semana, no formato da Torre de Controle: 4 páginas em A4 paisagem (eficiência, ritmo de produção, motivos das paradas e legenda). Na janela de impressão, escolha “Salvar como PDF”.</p></div>
         <div class="filters">
           <div class="filter"><label class="small" for="printEnd">Última semana (qualquer dia dela)</label><input id="printEnd" type="date"></div>
           <div class="filter"><label class="small" for="printWeeks">Semanas</label><select id="printWeeks"><option>2</option><option>3</option><option selected>4</option><option>6</option><option>8</option><option>12</option></select></div>
@@ -2095,6 +2212,21 @@
         <p>Paradas sem motivo contam como perda de eficiência até serem classificadas. A aba Metas mostra a classificação de cada motivo.</p>
       </div>
     </details>
+
+    <section id="stopReasonsSection">
+      <h2 class="section-title">Motivos das paradas</h2>
+      <article class="card stop-card">
+        <div class="chart-head">
+          <div><h3>Quanto cada motivo pesa no tempo parado</h3><p id="stopReasonsSub" class="muted"></p></div>
+          <div class="seg-ctl" role="group" aria-label="Quais paradas mostrar">
+            <button class="seg-btn active" type="button" data-rview="ind">Paradas dos indicadores</button>
+            <button class="seg-btn" type="button" data-rview="all">Com fora da jornada</button>
+          </div>
+        </div>
+        <div id="stopReasonsChart"></div>
+        <div id="stopReasonsTable"></div>
+      </article>
+    </section>
 
     <section id="trendSection" class="hidden">
       <h2 class="section-title">Evolução no período</h2>
